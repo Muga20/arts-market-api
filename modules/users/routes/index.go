@@ -16,4 +16,5 @@ func UserModuleSetupRoutes(apiGroup fiber.Router, db *gorm.DB, responseHandler *
 	SetupAccountRoutes(apiGroup, db, responseHandler, cld)
 	SetupRoleRoutes(apiGroup, db, responseHandler)
 	SetupAccountSecurityRoutes(apiGroup, db, responseHandler)
+	RegisterEngagementRoutes(apiGroup, db, responseHandler)
 }

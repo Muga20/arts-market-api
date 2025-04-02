@@ -2,6 +2,8 @@ package services
 
 import (
 	"fmt"
+	"log"
+
 	"github.com/google/uuid" // Import the uuid package
 	"github.com/hibiken/asynq"
 	"github.com/muga20/artsMarket/config"
@@ -53,6 +55,9 @@ func (s *NotificationService) EnqueueNotification(userID, senderID, notification
 		IsSystemGenerated: true,
 	}
 
+	// Log the notification being created
+	log.Printf("Enqueuing notification: UserID=%v, SenderID=%v, Message=%v", notification.UserID, notification.SenderID, notification.Message)
+
 	// Serialize the notification into the task payload
 	payload, err := notification.ToJSON()
 	if err != nil {
@@ -67,6 +72,8 @@ func (s *NotificationService) EnqueueNotification(userID, senderID, notification
 	if err != nil {
 		return s.ResponseHandler.Handle(nil, nil, fmt.Errorf("failed to enqueue task: %v", err))
 	}
+
+	log.Printf("Successfully enqueued notification task for UserID=%v", notification.UserID)
 
 	return nil
 }

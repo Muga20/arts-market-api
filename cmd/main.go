@@ -8,10 +8,13 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/muga20/artsMarket/config"
 	"github.com/muga20/artsMarket/database"
+	"github.com/muga20/artsMarket/modules/notifications/services"
 	user_module "github.com/muga20/artsMarket/modules/users/routes"
 	"github.com/muga20/artsMarket/pkg/logs/handlers"
 	logs_module "github.com/muga20/artsMarket/pkg/logs/routes"
-	"github.com/muga20/artsMarket/pkg/middleware"
+	"github.com/muga20/artsMarket/pkg/worker"
+
+	//"github.com/muga20/artsMarket/pkg/middleware"
 	"gorm.io/gorm"
 
 	_ "github.com/muga20/artsMarket/docs"
@@ -25,21 +28,20 @@ import (
 // @BasePath /api/v1
 
 func main() {
-	// Initialize Redis and database, then start the app
 	initializeRedis()
 	db := initializeDatabase()
-
-	// Initialize the response handler
 	responseHandler := handlers.NewResponseHandler(db)
 
-	// Create a new Fiber app
-	app := fiber.New()
+	// Initialize the notification service
+	notificationService := services.NewNotificationService(responseHandler)
 
-	// Set up middleware and routes
-	configureMiddleware(app)
-	setupRoutes(app, db, responseHandler)
+	// Create and start the worker
+	worker := worker.NewNotificationWorker(notificationService, responseHandler, db)
+	go worker.Start() // Start the worker in a separate goroutine
 
 	// Start the Fiber app
+	app := fiber.New()
+	setupRoutes(app, db, responseHandler)
 	startServer(app)
 }
 
@@ -77,7 +79,7 @@ func configureMiddleware(app *fiber.App) {
 	}))
 
 	// Apply rate-limiting middleware
-	app.Use(middleware.RateLimitMiddleware())
+	//app.Use(middleware.RateLimitMiddleware())
 }
 
 func setupRoutes(app *fiber.App, db *gorm.DB, responseHandler *handlers.ResponseHandler) {

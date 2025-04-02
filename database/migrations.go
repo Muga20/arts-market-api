@@ -34,15 +34,15 @@ func AutoMigrate(db *gorm.DB) error {
 	// Check if the 'error_logs' table exists to avoid unnecessary migrations
 	if tableExists(db, "error_logs") {
 		log.Println("✅ Table 'error_logs' already exists, skipping migration")
-		return nil
+	} else {
+		log.Println("🔄 Creating 'error_logs' table...")
 	}
 
 	log.Println("🔄 Running database migrations...")
 
-	// Run migrations for all models
-	if err := db.AutoMigrate(
-
-		//Module User
+	// Run migrations for all models and log each migration
+	migrations := []interface{}{
+		// Module User
 		&roles.Role{},                      // Role model
 		&users.User{},                      // User model
 		&user_session.UserSession{},        // User session model
@@ -55,12 +55,19 @@ func AutoMigrate(db *gorm.DB) error {
 		&follower.Follower{},               // Followers model
 		&blocked_user.BlockedUser{},        // Blocked users model
 
-		//Error logs
+		// Error logs
 		&error_log.ErrorLog{}, // Logging model
 
-		&notification.Notification{},
-	); err != nil {
-		return fmt.Errorf("auto migration failed: %w", err)
+		// Add the Notification model
+		&notification.Notification{}, // Notification model
+	}
+
+	// Loop through all migrations and apply them
+	for _, model := range migrations {
+		if err := db.AutoMigrate(model); err != nil {
+			return fmt.Errorf("auto migration failed for model %T: %w", model, err)
+		}
+		log.Printf("✅ Successfully migrated model: %T", model)
 	}
 
 	log.Println("✅ Database migration completed successfully")
