@@ -1,0 +1,7 @@
+root = "."
+tmp_dir = "tmp"
+[build]
+  cmd = "swag init -g cmd/main.go --parseDependency --parseInternal --parseDepth 3 && go build -o tmp/main cmd/main.go"
+  bin = "tmp/main"
+  exclude_dir = ["docs"]
+  delay = 1000
