@@ -2,6 +2,7 @@ package engagement
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -12,8 +13,7 @@ import (
 	"gorm.io/gorm"
 )
 
-// MaxFollowsPerDay limits how many users someone can follow per day
-const MaxFollowsPerDay = 10
+const MaxFollowsPerDay = 100
 
 // FollowUser godoc
 // @Summary Follow a user
@@ -29,69 +29,146 @@ const MaxFollowsPerDay = 10
 // @Router /engagement/follow/{id} [post]
 func FollowUser(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		// Get the authenticated user
+		// Authentication check
 		user, ok := c.Locals("user").(models.User)
 		if !ok {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "User not authenticated"}, fmt.Errorf("unauthenticated request"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication failed: user not found in context"))
 		}
 
-		// Extract following ID from the URL params
+		// Input validation
 		followingID := c.Params("id")
 		if user.ID.String() == followingID {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "You cannot follow yourself"}, nil)
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "You cannot follow yourself"))
 		}
 
-		// Parse the following user UUID
+		// Parse UUID
 		followingUUID, err := uuid.Parse(followingID)
 		if err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Invalid user ID"}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid user ID format"))
 		}
 
-		// Check if the user is already following the target user
+		// Start database transaction
+		tx := db.Begin()
+		if tx.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to start transaction: %w", tx.Error))
+		}
+
+		// Defer rollback in case of error
+		defer func() {
+			if r := recover(); r != nil {
+				tx.Rollback()
+			}
+		}()
+
+		// Check target user's privacy settings
+		var privacySettings models.UserPrivacySetting
+		if err := tx.Where("user_id = ?", followingUUID).First(&privacySettings).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				// If no settings exist, use default (which allows follow requests)
+				privacySettings.AllowFollowRequests = true
+			} else {
+				tx.Rollback()
+				return responseHandler.HandleResponse(c, nil,
+					fmt.Errorf("failed to check privacy settings: %w", err))
+			}
+		}
+
+		// Reject if follow requests not allowed
+		if !privacySettings.AllowFollowRequests {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusForbidden, "This user does not allow follow requests"))
+		}
+
+		// Check existing follow
 		var count int64
-		err = db.Model(&models.Follower{}).Where("follower_id = ? AND following_id = ?", user.ID, followingUUID).Count(&count).Error
-		if err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Database error"}, err)
-		}
-		if count > 0 {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "You already follow this user"}, nil)
+		if err := tx.Model(&models.Follower{}).
+			Where("follower_id = ? AND following_id = ?", user.ID, followingUUID).
+			Count(&count).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("database error checking follow status: %w", err))
 		}
 
-		// Check if the user has exceeded the daily follow limit
+		if count > 0 {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusConflict, "You already follow this user"))
+		}
+
+		// Check daily limit
 		var followCount int64
 		startOfDay := time.Now().Truncate(24 * time.Hour)
-		err = db.Model(&models.Follower{}).Where("follower_id = ? AND created_at >= ?", user.ID, startOfDay).Count(&followCount).Error
-		if err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Database error"}, err)
-		}
-		if followCount >= MaxFollowsPerDay {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "You have reached your daily follow limit"}, nil)
+		if err := tx.Model(&models.Follower{}).
+			Where("follower_id = ? AND created_at >= ?", user.ID, startOfDay).
+			Count(&followCount).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("database error checking daily limit: %w", err))
 		}
 
-		// Create the follow relationship
+		if followCount >= MaxFollowsPerDay {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusTooManyRequests, "Daily follow limit reached"))
+		}
+
+		// Create follow relationship
 		newFollow := models.Follower{
 			FollowerID:  user.ID,
 			FollowingID: followingUUID,
 		}
-		if err := db.Create(&newFollow).Error; err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Could not follow user"}, err)
+		if err := tx.Create(&newFollow).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("database error creating follow: %w", err))
 		}
 
-		// Send a notification to the user who is being followed
-		notificationService := services.NewNotificationService(responseHandler)
-		err = notificationService.EnqueueNotification(
-			followingUUID.String(), // Target user (the one being followed)
-			user.ID.String(),       // Follower (the one who followed)
-			"follow",               // Notification type
-			"user followed you",    // Message
-			"user",                 // Entity type
-			followingUUID.String(), // Entity ID (user being followed)
-		)
-		if err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Notification sending failed"}, err)
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to commit transaction: %w", err))
 		}
 
-		return responseHandler.HandleResponse(c, fiber.Map{"success": true, "message": "You are now following this user"}, nil)
+		// Send notification with profile photo in message (non-blocking)
+		go func() {
+			var profilePhoto string
+			if err := db.Model(&models.UserDetail{}).
+				Where("user_id = ?", user.ID).
+				Select("profile_image").
+				First(&profilePhoto).Error; err == nil {
+
+				// Include profile photo URL in message if available
+				notificationService := services.NewNotificationService(responseHandler)
+				_ = notificationService.EnqueueNotification(
+					followingUUID.String(),
+					user.ID.String(),
+					"follow",
+					fmt.Sprintf("%s|%s followed you", user.Username, profilePhoto),
+					"user",
+					followingUUID.String(),
+				)
+			} else {
+				// Fallback without photo if there's an error
+				notificationService := services.NewNotificationService(responseHandler)
+				_ = notificationService.EnqueueNotification(
+					followingUUID.String(),
+					user.ID.String(),
+					"follow",
+					fmt.Sprintf("%s followed you", user.Username), // Original format
+					"user",
+					followingUUID.String(),
+				)
+			}
+		}()
+
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "You followed this user",
+		}, nil)
 	}
 }
 
@@ -107,22 +184,54 @@ func FollowUser(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Ha
 // @Router /engagement/unfollow/{id} [delete]
 func UnfollowUser(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		// Authentication check
 		user, ok := c.Locals("user").(models.User)
 		if !ok {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "User not authenticated"}, fmt.Errorf("unauthenticated request"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
 
+		// Validate user ID
 		followingID := c.Params("id")
 		followingUUID, err := uuid.Parse(followingID)
 		if err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Invalid user ID"}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid user ID"))
 		}
 
-		if err := db.Where("follower_id = ? AND following_id = ?", user.ID, followingUUID).Delete(&models.Follower{}).Error; err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Could not unfollow user"}, err)
+		// Start transaction
+		tx := db.Begin()
+		if tx.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to start transaction: %w", tx.Error))
 		}
 
-		return responseHandler.HandleResponse(c, fiber.Map{"success": true, "message": "You have unfollowed this user"}, nil)
+		// Perform unfollow operation
+		result := tx.Where("follower_id = ? AND following_id = ?", user.ID, followingUUID).
+			Delete(&models.Follower{})
+
+		if result.Error != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("database error unfollowing user: %w", result.Error))
+		}
+
+		// Check if any rows were actually deleted
+		if result.RowsAffected == 0 {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusNotFound, "You were not following this user"))
+		}
+
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to commit transaction: %w", err))
+		}
+
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "You unfollowed this user",
+		}, nil)
 	}
 }
 
@@ -137,78 +246,111 @@ func UnfollowUser(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.
 // @Router /engagement/stats/session-user [get]
 func GetUserFollowStatsForAuthUser(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		// Get logged-in user
+		// Authentication check - get user from context
 		user, ok := c.Locals("user").(models.User)
 		if !ok {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "User not authenticated"}, fmt.Errorf("unauthenticated request"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
 
-		var followerCount, followingCount int64
-		var followers []models.Follower
-		var followings []models.Follower
+		// Get the user's UUID
+		userUUID := user.ID
 
-		// Count and retrieve followers (people following the user)
-		err := db.Model(&models.Follower{}).
-			Where("following_id = ?", user.ID).
-			Count(&followerCount).Find(&followers).Error
-		if err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Error retrieving followers"}, err)
-		}
-
-		// Count and retrieve followings (people the user follows)
-		err = db.Model(&models.Follower{}).
-			Where("follower_id = ?", user.ID).
-			Count(&followingCount).Find(&followings).Error
-		if err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Error retrieving followings"}, err)
-		}
-
-		// Struct to store follower/following user details
 		type UserDetails struct {
-			ID        uuid.UUID `json:"id"`
-			Username  string    `json:"username"`
-			FirstName string    `json:"first_name"`
-			LastName  string    `json:"last_name"`
+			ID           uuid.UUID `json:"id"`
+			Username     string    `json:"username"`
+			FirstName    string    `json:"first_name,omitempty"`
+			LastName     string    `json:"last_name,omitempty"`
+			ProfileImage string    `json:"profile_image,omitempty"`
 		}
 
-		var followersDetails []UserDetails
-		var followingsDetails []UserDetails
+		var stats struct {
+			FollowerCount  int64         `json:"followers_count"`
+			FollowingCount int64         `json:"following_count"`
+			Followers      []UserDetails `json:"followers,omitempty"`
+			Followings     []UserDetails `json:"followings,omitempty"`
+		}
 
-		// Retrieve detailed information for followers
-		for _, follower := range followers {
-			var details UserDetails
-			err := db.Table("users").
-				Select("users.id, users.username, user_details.first_name, user_details.last_name").
-				Joins("LEFT JOIN user_details ON users.id = user_details.user_id").
-				Where("users.id = ?", follower.FollowerID).
-				First(&details).Error
-			if err != nil {
-				return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Error retrieving follower details"}, err)
+		// Create separate database connections for parallel queries
+		dbFollowerCount := db.Session(&gorm.Session{})
+		dbFollowingCount := db.Session(&gorm.Session{})
+		dbFollowers := db.Session(&gorm.Session{})
+		dbFollowings := db.Session(&gorm.Session{})
+
+		// Use parallel execution with separate connections
+		errChan := make(chan error, 4)
+		var wg sync.WaitGroup
+		wg.Add(4)
+
+		// Get follower count
+		go func() {
+			defer wg.Done()
+			if err := dbFollowerCount.Model(&models.Follower{}).
+				Where("following_id = ?", userUUID).
+				Count(&stats.FollowerCount).Error; err != nil {
+				errChan <- fmt.Errorf("follower count error: %w", err)
 			}
-			followersDetails = append(followersDetails, details)
-		}
+		}()
 
-		// Retrieve detailed information for followings
-		for _, following := range followings {
-			var details UserDetails
-			err := db.Table("users").
-				Select("users.id, users.username, user_details.first_name, user_details.last_name").
-				Joins("LEFT JOIN user_details ON users.id = user_details.user_id").
-				Where("users.id = ?", following.FollowingID).
-				First(&details).Error
-			if err != nil {
-				return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Error retrieving following details"}, err)
+		// Get following count
+		go func() {
+			defer wg.Done()
+			if err := dbFollowingCount.Model(&models.Follower{}).
+				Where("follower_id = ?", userUUID).
+				Count(&stats.FollowingCount).Error; err != nil {
+				errChan <- fmt.Errorf("following count error: %w", err)
 			}
-			followingsDetails = append(followingsDetails, details)
+		}()
+
+		// Get followers with details
+		go func() {
+			defer wg.Done()
+			if err := dbFollowers.Table("followers").
+				Select(`
+                    users.id,
+                    users.username,
+                    user_details.first_name,
+                    user_details.last_name,
+                    user_details.profile_image
+                `).
+				Joins("JOIN users ON followers.follower_id = users.id").
+				Joins("LEFT JOIN user_details ON users.id = user_details.user_id").
+				Where("followers.following_id = ?", userUUID).
+				Scan(&stats.Followers).Error; err != nil {
+				errChan <- fmt.Errorf("follower details error: %w", err)
+			}
+		}()
+
+		// Get followings with details
+		go func() {
+			defer wg.Done()
+			if err := dbFollowings.Table("followers").
+				Select(`
+                    users.id,
+                    users.username,
+                    user_details.first_name,
+                    user_details.last_name,
+                    user_details.profile_image
+                `).
+				Joins("JOIN users ON followers.following_id = users.id").
+				Joins("LEFT JOIN user_details ON users.id = user_details.user_id").
+				Where("followers.follower_id = ?", userUUID).
+				Scan(&stats.Followings).Error; err != nil {
+				errChan <- fmt.Errorf("following details error: %w", err)
+			}
+		}()
+
+		wg.Wait()
+		close(errChan)
+
+		// Check for errors
+		for e := range errChan {
+			if e != nil {
+				return responseHandler.HandleResponse(c, nil, e)
+			}
 		}
 
-		// Prepare the response with follower and following details
-		return responseHandler.HandleResponse(c, fiber.Map{
-			"followers_count": followerCount,
-			"following_count": followingCount,
-			"followers":       followersDetails,
-			"followings":      followingsDetails,
-		}, nil)
+		return responseHandler.HandleResponse(c, stats, nil)
 	}
 }
 
@@ -224,77 +366,102 @@ func GetUserFollowStatsForAuthUser(db *gorm.DB, responseHandler *handlers.Respon
 // @Router /engagement/stats/{id} [get]
 func GetUserFollowStats(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		// Validate and parse user ID
 		userID := c.Params("id")
 		userUUID, err := uuid.Parse(userID)
 		if err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Invalid user ID"}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid user ID format"))
 		}
 
-		var followerCount, followingCount int64
-		var followers []models.Follower
-		var followings []models.Follower
-
-		// Count and retrieve followers (people following the user)
-		err = db.Model(&models.Follower{}).
-			Where("following_id = ?", userUUID).
-			Count(&followerCount).Find(&followers).Error
-		if err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Error retrieving followers"}, err)
-		}
-
-		// Count and retrieve followings (people the user follows)
-		err = db.Model(&models.Follower{}).
-			Where("follower_id = ?", userUUID).
-			Count(&followingCount).Find(&followings).Error
-		if err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Error retrieving followings"}, err)
-		}
-
-		// Struct to store follower/following user details
 		type UserDetails struct {
-			ID        uuid.UUID `json:"id"`
-			Username  string    `json:"username"`
-			FirstName string    `json:"first_name"`
-			LastName  string    `json:"last_name"`
+			ID           uuid.UUID `json:"id"`
+			Username     string    `json:"username"`
+			FirstName    string    `json:"first_name,omitempty"`
+			LastName     string    `json:"last_name,omitempty"`
+			ProfileImage string    `json:"profile_image,omitempty"`
 		}
 
-		var followersDetails []UserDetails
-		var followingsDetails []UserDetails
+		var stats struct {
+			FollowerCount  int64         `json:"followers_count"`
+			FollowingCount int64         `json:"following_count"`
+			Followers      []UserDetails `json:"followers,omitempty"`
+			Followings     []UserDetails `json:"followings,omitempty"`
+		}
 
-		// Retrieve detailed information for followers
-		for _, follower := range followers {
-			var details UserDetails
-			err := db.Table("users").
-				Select("users.id, users.username, user_details.first_name, user_details.last_name, user_details.profile_image").
-				Joins("LEFT JOIN user_details ON users.id = user_details.user_id").
-				Where("users.id = ?", follower.FollowerID).
-				First(&details).Error
-			if err != nil {
-				return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Error retrieving follower details"}, err)
+		// Use parallel execution for better performance
+		errChan := make(chan error, 4)
+		var wg sync.WaitGroup
+		wg.Add(4)
+
+		// Get follower count
+		go func() {
+			defer wg.Done()
+			if err := db.Model(&models.Follower{}).
+				Where("following_id = ?", userUUID).
+				Count(&stats.FollowerCount).Error; err != nil {
+				errChan <- fmt.Errorf("follower count error: %w", err)
 			}
-			followersDetails = append(followersDetails, details)
-		}
+		}()
 
-		// Retrieve detailed information for followings
-		for _, following := range followings {
-			var details UserDetails
-			err := db.Table("users").
-				Select("users.id, users.username, user_details.first_name, user_details.last_name, user_details.profile_image").
-				Joins("LEFT JOIN user_details ON users.id = user_details.user_id").
-				Where("users.id = ?", following.FollowingID).
-				First(&details).Error
-			if err != nil {
-				return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Error retrieving following details"}, err)
+		// Get following count
+		go func() {
+			defer wg.Done()
+			if err := db.Model(&models.Follower{}).
+				Where("follower_id = ?", userUUID).
+				Count(&stats.FollowingCount).Error; err != nil {
+				errChan <- fmt.Errorf("following count error: %w", err)
 			}
-			followingsDetails = append(followingsDetails, details)
+		}()
+
+		// Get followers with details
+		go func() {
+			defer wg.Done()
+			if err := db.Table("followers").
+				Select(`
+                    users.id,
+                    users.username,
+                    user_details.first_name,
+                    user_details.last_name,
+                    user_details.profile_image
+                `).
+				Joins("JOIN users ON followers.follower_id = users.id").
+				Joins("LEFT JOIN user_details ON users.id = user_details.user_id").
+				Where("followers.following_id = ?", userUUID).
+				Scan(&stats.Followers).Error; err != nil {
+				errChan <- fmt.Errorf("follower details error: %w", err)
+			}
+		}()
+
+		// Get followings with details
+		go func() {
+			defer wg.Done()
+			if err := db.Table("followers").
+				Select(`
+                    users.id,
+                    users.username,
+                    user_details.first_name,
+                    user_details.last_name,
+                    user_details.profile_image
+                `).
+				Joins("JOIN users ON followers.following_id = users.id").
+				Joins("LEFT JOIN user_details ON users.id = user_details.user_id").
+				Where("followers.follower_id = ?", userUUID).
+				Scan(&stats.Followings).Error; err != nil {
+				errChan <- fmt.Errorf("following details error: %w", err)
+			}
+		}()
+
+		wg.Wait()
+		close(errChan)
+
+		// Check for errors
+		for e := range errChan {
+			if e != nil {
+				return responseHandler.HandleResponse(c, nil, e)
+			}
 		}
 
-		// Prepare the response with follower and following details
-		return responseHandler.HandleResponse(c, fiber.Map{
-			"followers_count": followerCount,
-			"following_count": followingCount,
-			"followers":       followersDetails,
-			"followings":      followingsDetails,
-		}, nil)
+		return responseHandler.HandleResponse(c, stats, nil)
 	}
 }

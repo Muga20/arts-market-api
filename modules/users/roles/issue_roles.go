@@ -2,11 +2,15 @@ package roles
 
 import (
 	"errors"
+	"fmt"
+	"sync"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/muga20/artsMarket/modules/users/models"
 	"github.com/muga20/artsMarket/pkg/logs/handlers"
+	"github.com/muga20/artsMarket/pkg/validation"
 	"gorm.io/gorm"
 )
 
@@ -29,52 +33,86 @@ type Request struct {
 // @Router /roles/assign [post]
 func AssignRole(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-
 		var req Request
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false, "message": "Invalid request body",
-			}, errors.New("invalid request body"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request body"))
 		}
 
-		// Check if user exists
+		// Validate UUIDs
+		if !validation.IsValidUUID(req.UserID.String()) || !validation.IsValidUUID(req.RoleID.String()) {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid ID format"))
+		}
+
+		// Start transaction
+		tx := db.Begin()
+		if tx.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to start transaction: %w", tx.Error))
+		}
+
+		// Check if user exists with row lock
 		var user models.User
-		if err := db.First(&user, "id = ?", req.UserID).Error; err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false, "message": "User not found",
-			}, errors.New("user not found"))
+		if err := tx.Set("gorm:query_option", "FOR UPDATE").
+			Where("id = ?", req.UserID).
+			First(&user).Error; err != nil {
+			tx.Rollback()
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusNotFound, "User not found"))
+			}
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to find user: %w", err))
 		}
 
 		// Check if role exists
 		var role models.Role
-		if err := db.First(&role, "id = ?", req.RoleID).Error; err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false, "message": "Role not found",
-			}, errors.New("role not found"))
+		if err := tx.Where("id = ?", req.RoleID).First(&role).Error; err != nil {
+			tx.Rollback()
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusNotFound, "Role not found"))
+			}
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to find role: %w", err))
 		}
 
-		// Check if user already has the role
-		var userRole models.UserRole
-		if err := db.Where("user_id = ? AND role_id = ?", req.UserID, req.RoleID).First(&userRole).Error; err == nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false, "message": "User already has this role",
-			}, errors.New("user already has this role"))
+		// Check for existing role assignment
+		var existingAssignment models.UserRole
+		if err := tx.Where("user_id = ? AND role_id = ?", req.UserID, req.RoleID).
+			First(&existingAssignment).Error; err == nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusConflict, "User already has this role"))
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to check existing role assignment: %w", err))
 		}
 
-		// Assign role to user
-		userRole = models.UserRole{
+		// Create new role assignment
+		newAssignment := models.UserRole{
+			ID:       uuid.New(),
 			UserID:   req.UserID,
 			RoleID:   req.RoleID,
 			IsActive: true,
 		}
-		if err := db.Create(&userRole).Error; err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false, "message": "Failed to assign role",
-			}, errors.New("failed to assign role"))
+
+		if err := tx.Create(&newAssignment).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to assign role: %w", err))
 		}
 
-		return responseHandler.Handle(c, map[string]interface{}{
-			"success": true, "message": "Role assigned successfully",
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to commit transaction: %w", err))
+		}
+
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Role assigned successfully",
 		}, nil)
 	}
 }
@@ -92,31 +130,54 @@ func AssignRole(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Ha
 // @Router /roles/remove [post]
 func RemoveRole(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-
 		var req Request
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false, "message": "Invalid request body",
-			}, errors.New("invalid request body"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request body"))
 		}
 
-		// Find user role entry
+		// Validate UUIDs
+		if !validation.IsValidUUID(req.UserID.String()) || !validation.IsValidUUID(req.RoleID.String()) {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid ID format"))
+		}
+
+		// Start transaction with serializable isolation level for data consistency
+		tx := db.Begin()
+		if tx.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to start transaction: %w", tx.Error))
+		}
+
+		// Find and lock the user role entry
 		var userRole models.UserRole
-		if err := db.Where("user_id = ? AND role_id = ?", req.UserID, req.RoleID).First(&userRole).Error; err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false, "message": "Role not found for this user",
-			}, errors.New("role not found for this user"))
+		if err := tx.Set("gorm:query_option", "FOR UPDATE").
+			Where("user_id = ? AND role_id = ?", req.UserID, req.RoleID).
+			First(&userRole).Error; err != nil {
+			tx.Rollback()
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusNotFound, "Role assignment not found for this user"))
+			}
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to find role assignment: %w", err))
 		}
 
 		// Delete role assignment
-		if err := db.Delete(&userRole).Error; err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false, "message": "Failed to remove role",
-			}, errors.New("failed to remove role"))
+		if err := tx.Delete(&userRole).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to remove role assignment: %w", err))
 		}
 
-		return responseHandler.Handle(c, map[string]interface{}{
-			"success": true, "message": "Role removed successfully",
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to commit transaction: %w", err))
+		}
+
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Role removed successfully",
 		}, nil)
 	}
 }
@@ -136,32 +197,53 @@ func GetUserRoles(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.
 	return func(c *fiber.Ctx) error {
 		userID := c.Params("user_id")
 		if userID == "" {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false, "message": "user_id is required",
-			}, errors.New("user_id is required"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "user_id is required"))
 		}
 
 		parsedID, err := uuid.Parse(userID)
 		if err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false, "message": "Invalid user_id format",
-			}, errors.New("invalid user_id format"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid user_id format"))
 		}
 
-		// Define a slice to store only role data
-		var roles []models.Role
+		// Use parallel execution for better performance
+		errChan := make(chan error, 1)
+		var wg sync.WaitGroup
+		wg.Add(1)
+
+		var roles []struct {
+			ID         uuid.UUID `json:"id"`
+			RoleName   string    `json:"role_name"`
+			RoleNumber int       `json:"role_number"`
+			CreatedAt  time.Time `json:"created_at"`
+			UpdatedAt  time.Time `json:"updated_at"`
+		}
 
 		// Fetch roles assigned to the user
-		if err := db.Joins("JOIN user_roles ON user_roles.role_id = roles.id").
-			Where("user_roles.user_id = ?", parsedID).
-			Find(&roles).Error; err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false, "message": "Failed to fetch user roles",
-			}, errors.New("failed to fetch user roles"))
+		go func() {
+			defer wg.Done()
+			if err := db.Table("roles").
+				Select("roles.id, roles.role_name, roles.role_number, roles.created_at, roles.updated_at").
+				Joins("JOIN user_roles ON user_roles.role_id = roles.id").
+				Where("user_roles.user_id = ?", parsedID).
+				Scan(&roles).Error; err != nil {
+				errChan <- fmt.Errorf("failed to fetch user roles: %w", err)
+			}
+		}()
+
+		wg.Wait()
+		close(errChan)
+
+		// Check for errors
+		for e := range errChan {
+			if e != nil {
+				return responseHandler.HandleResponse(c, nil, e)
+			}
 		}
 
-		return responseHandler.Handle(c, map[string]interface{}{
-			"success": true, "message": "User roles retrieved successfully", "roles": roles,
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "User roles retrieved successfully",
 		}, nil)
 	}
 }

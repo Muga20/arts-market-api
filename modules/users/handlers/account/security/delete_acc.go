@@ -1,7 +1,7 @@
 package security
 
 import (
-	"errors"
+	"fmt"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/muga20/artsMarket/modules/users/models"
@@ -29,71 +29,66 @@ type DeleteAccountRequest struct {
 // @Router /security/delete-account [delete]
 func DeleteAccount(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		// Get user from context (assumed to be set by the authentication middleware)
+		// Authentication check with proper type assertion
 		user, ok := c.Locals("user").(models.User)
 		if !ok {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false,
-				"message": "user not found in context",
-			}, errors.New("user not found in context"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
 
-		// Parse the body to get the password for verification
+		// Parse request body
 		var req DeleteAccountRequest
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false,
-				"message": "invalid request body",
-			}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request body"))
 		}
 
-		// Fetch the user’s hashed password from the database
+		// Validate password is provided
+		if req.Password == "" {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Password is required"))
+		}
+
+		// Fetch user security record
 		var userSecurity models.UserSecurity
 		if err := db.Where("user_id = ?", user.ID).First(&userSecurity).Error; err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false,
-				"message": "user not found",
-			}, err)
-		}
-
-		// Compare the provided password with the hashed password stored in the database
-		err := bcrypt.CompareHashAndPassword([]byte(userSecurity.Password), []byte(req.Password))
-		if err != nil {
-			// If password does not match
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false,
-				"message": "incorrect password",
-			}, errors.New("incorrect password"))
-		}
-
-		// Begin transaction to delete user and user security data
-		err = db.Transaction(func(tx *gorm.DB) error {
-			// Delete the associated UserSecurity record
-			if err := tx.Where("user_id = ?", user.ID).Delete(&models.UserSecurity{}).Error; err != nil {
-				return err
+			if err == gorm.ErrRecordNotFound {
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusNotFound, "User account not found"))
 			}
-
-			// Delete the User record
-			if err := tx.Delete(&models.User{}, user.ID).Error; err != nil {
-				return err
-			}
-
-			return nil
-		})
-
-		// Handle error during transaction
-		if err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false,
-				"message": "failed to delete account",
-			}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to fetch user security: %w", err))
 		}
 
-		// Return success message
-		return responseHandler.Handle(c, map[string]interface{}{
-			"success": true,
-			"message": "account deleted successfully",
+		// Verify password
+		if err := bcrypt.CompareHashAndPassword([]byte(userSecurity.Password), []byte(req.Password)); err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Incorrect password"))
+		}
+
+		// Start explicit transaction
+		tx := db.Begin()
+		if tx.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to start transaction: %w", tx.Error))
+		}
+
+		// Soft delete by setting is_active to false
+		if err := tx.Model(&models.User{}).Where("id = ?", user.ID).
+			Update("is_active", false).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to deactivate user: %w", err))
+		}
+
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to commit transaction: %w", err))
+		}
+
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Account deactivated successfully",
 		}, nil)
 	}
 }
-

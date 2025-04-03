@@ -1,7 +1,7 @@
 package security
 
 import (
-	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/go-playground/validator/v10"
@@ -30,46 +30,64 @@ type UpdateUsernameRequest struct {
 // @Router /security/username [put]
 func UpdateUsername(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		// Get the user from context (assumed to be set by authentication middleware)
+		// Authentication check with proper type assertion
 		user, ok := c.Locals("user").(models.User)
 		if !ok {
-			return responseHandler.Handle(c, nil, errors.New("user not found in context"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
 
-		// Parse the request body for the new username
+		// Parse request body
 		var req UpdateUsernameRequest
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.Handle(c, nil, errors.New("invalid request body"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request body"))
 		}
 
-		// Validate the new username
+		// Validate username
 		validate := validator.New()
 		if err := validate.Struct(req); err != nil {
-			return responseHandler.Handle(c, map[string]string{"error": "validation failed"}, err)
-		}
-
-		// Check if the new username is the same as the current one
-		if req.Username == user.Username {
-			return responseHandler.Handle(c, nil, errors.New("new username cannot be the same as the current username"))
-		}
-
-		// Check if the new username is already taken by another user
-		var existingUser models.User
-		if err := db.Where("username = ? AND id != ?", req.Username, user.ID).First(&existingUser).Error; err != gorm.ErrRecordNotFound {
-			if err == nil {
-				return responseHandler.Handle(c, nil, errors.New("username is already in use"))
+			validationErrors := err.(validator.ValidationErrors)
+			errorMessages := make(map[string]string)
+			for _, e := range validationErrors {
+				if e.Field() == "Username" {
+					errorMessages["username"] = "Username must be between 3-20 alphanumeric characters"
+				}
 			}
-			return responseHandler.Handle(c, nil, err)
+			return responseHandler.HandleResponse(c, fiber.Map{
+				"errors": errorMessages,
+			}, fiber.NewError(fiber.StatusUnprocessableEntity, "Validation failed"))
+		}
+
+		// Check if username is same as current
+		if req.Username == user.Username {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "New username cannot be the same as current username"))
+		}
+
+		// Check if username is available
+		var existingUser models.User
+		if err := db.Where("username = ? AND id != ?", req.Username, user.ID).
+			First(&existingUser).Error; err != nil {
+			if err != gorm.ErrRecordNotFound {
+				return responseHandler.HandleResponse(c, nil,
+					fmt.Errorf("failed to check username availability: %w", err))
+			}
+		} else {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusConflict, "Username is already taken"))
 		}
 
 		// Update username
 		user.Username = req.Username
 		if err := db.Save(&user).Error; err != nil {
-			return responseHandler.Handle(c, nil, err)
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to update username: %w", err))
 		}
 
-		// Return success message
-		return responseHandler.Handle(c, map[string]string{"message": "username updated successfully"}, nil)
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Username updated successfully",
+		}, nil)
 	}
 }
 
@@ -85,17 +103,34 @@ func UpdateUsername(db *gorm.DB, responseHandler *handlers.ResponseHandler) fibe
 // @Router /security/search-usernames [get]
 func SearchUsernames(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		// Get and validate search keyword
 		keyword := c.Query("keyword")
 		if keyword == "" {
-			return responseHandler.Handle(c, nil, errors.New("keyword is required"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Search keyword is required"))
 		}
 
+		// Sanitize keyword (basic protection against SQL injection)
+		keyword = strings.TrimSpace(keyword)
+		if len(keyword) < 2 {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Keyword must be at least 2 characters"))
+		}
+
+		// Perform case-insensitive search
 		var usernames []string
 		searchPattern := "%" + strings.ToLower(keyword) + "%"
-		if err := db.Model(&models.User{}).Where("LOWER(username) LIKE ?", searchPattern).Pluck("username", &usernames).Error; err != nil {
-			return responseHandler.Handle(c, nil, err)
+		if err := db.Model(&models.User{}).
+			Select("username").
+			Where("LOWER(username) LIKE ?", searchPattern).
+			Limit(20).
+			Pluck("username", &usernames).Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to search usernames: %w", err))
 		}
 
-		return responseHandler.Handle(c, usernames, nil)
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"results": usernames,
+		}, nil)
 	}
 }

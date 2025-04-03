@@ -1,7 +1,8 @@
 package security
 
 import (
-	"errors"
+	"fmt"
+	"log"
 	"time"
 
 	"github.com/go-playground/validator/v10"
@@ -34,74 +35,118 @@ type UpdateEmailRequest struct {
 // @Router /security/email [put]
 func UpdateEmail(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		// Authentication check with proper type assertion
 		user, ok := c.Locals("user").(models.User)
 		if !ok {
-			return responseHandler.Handle(c, nil, errors.New("user not found in context"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
 
+		// Parse request body
 		var req UpdateEmailRequest
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.Handle(c, nil, errors.New("invalid request body"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request body"))
 		}
 
+		// Validate email
 		validate := validator.New()
 		if err := validate.Struct(req); err != nil {
-			return responseHandler.Handle(c, map[string]string{"error": "validation failed"}, errors.New("validation failed"))
-		}
-
-		var existingUser models.User
-		if err := db.Where("email = ? AND id != ?", req.Email, user.ID).First(&existingUser).Error; err != gorm.ErrRecordNotFound {
-			if err == nil {
-				return responseHandler.Handle(c, nil, errors.New("email is already in use"))
-			}
-			return responseHandler.Handle(c, nil, err)
-		}
-
-		verificationToken := uuid.New().String()
-		err := db.Transaction(func(tx *gorm.DB) error {
-			user.Email = req.Email
-			if err := tx.Save(&user).Error; err != nil {
-				return err
-			}
-
-			var userSecurity models.UserSecurity
-			if err := tx.Where("user_id = ?", user.ID).First(&userSecurity).Error; err != nil {
-				if err == gorm.ErrRecordNotFound {
-					userSecurity = models.UserSecurity{UserID: user.ID, Password: ""}
-				} else {
-					return err
+			validationErrors := err.(validator.ValidationErrors)
+			errorMessages := make(map[string]string)
+			for _, e := range validationErrors {
+				if e.Field() == "Email" {
+					errorMessages["email"] = "Valid email address is required"
 				}
 			}
+			return responseHandler.HandleResponse(c, fiber.Map{
+				"errors": errorMessages,
+			}, fiber.NewError(fiber.StatusUnprocessableEntity, "Validation failed"))
+		}
 
+		// Check if email is already in use
+		var existingUser models.User
+		if err := db.Where("email = ? AND id != ?", req.Email, user.ID).
+			First(&existingUser).Error; err != nil {
+			if err != gorm.ErrRecordNotFound {
+				return responseHandler.HandleResponse(c, nil,
+					fmt.Errorf("failed to check email availability: %w", err))
+			}
+		} else {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusConflict, "Email is already in use"))
+		}
+
+		// Generate verification token
+		verificationToken := uuid.New().String()
+		expiration := time.Now().Add(24 * time.Hour)
+
+		// Start explicit transaction
+		tx := db.Begin()
+		if tx.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to start transaction: %w", tx.Error))
+		}
+
+		// Update user email
+		user.Email = req.Email
+		if err := tx.Save(&user).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to update email: %w", err))
+		}
+
+		// Update or create user security record
+		var userSecurity models.UserSecurity
+		if err := tx.Where("user_id = ?", user.ID).First(&userSecurity).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				userSecurity = models.UserSecurity{
+					UserID:                 user.ID,
+					IsEmailVerifiedAt:      nil,
+					PasswordResetToken:     &verificationToken,
+					PasswordResetExpiresAt: &expiration,
+				}
+			} else {
+				tx.Rollback()
+				return responseHandler.HandleResponse(c, nil,
+					fmt.Errorf("failed to fetch user security: %w", err))
+			}
+		} else {
 			userSecurity.IsEmailVerifiedAt = nil
-			expiration := time.Now().Add(24 * time.Hour)
 			userSecurity.PasswordResetToken = &verificationToken
 			userSecurity.PasswordResetExpiresAt = &expiration
+		}
 
-			if err := tx.Save(&userSecurity).Error; err != nil {
-				return err
+		if err := tx.Save(&userSecurity).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to update security record: %w", err))
+		}
+
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to commit transaction: %w", err))
+		}
+
+		// Send verification email (non-blocking)
+		go func() {
+			task, err := tasks.NewSendEmailVerificationTask(req.Email, verificationToken)
+			if err != nil {
+				log.Printf("Failed to create email verification task: %v", err)
+				return
 			}
 
-			return nil
-		})
-		if err != nil {
-			return responseHandler.Handle(c, nil, err)
-		}
+			client := asynq.NewClient(*config.RedisConfig)
+			defer client.Close()
+			if _, err := client.Enqueue(task); err != nil {
+				log.Printf("Failed to enqueue email verification task: %v", err)
+			}
+		}()
 
-		task, err := tasks.NewSendEmailVerificationTask(req.Email, verificationToken)
-		if err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to create email verification task"))
-		}
-
-		client := asynq.NewClient(*config.RedisConfig)
-		defer client.Close()
-		_, err = client.Enqueue(task)
-		if err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to enqueue email verification task"))
-		}
-
-		return responseHandler.Handle(c, map[string]string{
-			"message": "email updated successfully, please verify your new email"}, nil)
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Email updated successfully. Please verify your new email.",
+		}, nil)
 	}
 }
 
@@ -117,27 +162,54 @@ func UpdateEmail(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.H
 // @Failure 500 {object} map[string]string
 // @Router /security/verify-email [get]
 func VerifyEmail(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
-	return func(c *fiber.Ctx) error {
-		token := c.Query("token")
-		if token == "" {
-			return responseHandler.Handle(c, nil, errors.New("token is required"))
-		}
+    return func(c *fiber.Ctx) error {
+        // Validate token
+        token := c.Query("token")
+        if token == "" {
+            return responseHandler.HandleResponse(c, nil,
+                fiber.NewError(fiber.StatusBadRequest, "Verification token is required"))
+        }
 
-		var userSecurity models.UserSecurity
-		if err := db.Where("password_reset_token = ? AND password_reset_expires_at > ?", token, time.Now()).First(&userSecurity).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("invalid or expired token"))
-		}
+        // Start database transaction
+        tx := db.Begin()
+        if tx.Error != nil {
+            return responseHandler.HandleResponse(c, nil,
+                fmt.Errorf("failed to start transaction: %w", tx.Error))
+        }
 
-		now := time.Now()
-		userSecurity.IsEmailVerifiedAt = &now
-		userSecurity.PasswordResetToken = nil
-		userSecurity.PasswordResetExpiresAt = nil
-		if err := db.Save(&userSecurity).Error; err != nil {
-			return responseHandler.Handle(c, nil, err)
-		}
+        // Find valid token
+        var userSecurity models.UserSecurity
+        if err := tx.Where("password_reset_token = ? AND password_reset_expires_at > ?", token, time.Now()).
+            First(&userSecurity).Error; err != nil {
+            tx.Rollback()
+            if err == gorm.ErrRecordNotFound {
+                return responseHandler.HandleResponse(c, nil,
+                    fiber.NewError(fiber.StatusUnauthorized, "Invalid or expired verification token"))
+            }
+            return responseHandler.HandleResponse(c, nil,
+                fmt.Errorf("failed to verify token: %w", err))
+        }
 
-		return responseHandler.Handle(c, map[string]string{
-			"message": "email verified successfully",
-		}, nil)
-	}
+        // Update verification status
+        now := time.Now()
+        userSecurity.IsEmailVerifiedAt = &now
+        userSecurity.PasswordResetToken = nil
+        userSecurity.PasswordResetExpiresAt = nil
+
+        if err := tx.Save(&userSecurity).Error; err != nil {
+            tx.Rollback()
+            return responseHandler.HandleResponse(c, nil,
+                fmt.Errorf("failed to update verification status: %w", err))
+        }
+
+        // Commit transaction
+        if err := tx.Commit().Error; err != nil {
+            return responseHandler.HandleResponse(c, nil,
+                fmt.Errorf("failed to commit transaction: %w", err))
+        }
+
+        return responseHandler.HandleResponse(c, fiber.Map{
+            "message": "Email verified successfully",
+        }, nil)
+    }
 }

@@ -2,6 +2,7 @@ package roles
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -38,7 +39,8 @@ func CreateRoleHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) f
 	return func(c *fiber.Ctx) error {
 		var req CreateRoleRequest
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.Handle(c, nil, errors.New("invalid request payload"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request payload"))
 		}
 
 		role := models.Role{
@@ -51,10 +53,13 @@ func CreateRoleHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) f
 		}
 
 		if err := db.Create(&role).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to create role"))
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to create role: %w", err))
 		}
 
-		return responseHandler.Handle(c, fiber.Map{"message": "Role created successfully", "role": role}, nil)
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Role created successfully",
+		}, nil)
 	}
 }
 
@@ -71,10 +76,16 @@ func GetAllRolesHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) 
 	return func(c *fiber.Ctx) error {
 		var roles []models.Role
 		if err := db.Find(&roles).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to retrieve roles"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusInternalServerError, "Failed to retrieve roles"))
 		}
 
-		return responseHandler.Handle(c, fiber.Map{"roles": roles}, nil)
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"data": fiber.Map{
+				"roles": roles,
+				"count": len(roles),
+			},
+		}, nil)
 	}
 }
 
@@ -92,16 +103,26 @@ func GetAllRolesHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) 
 func GetRoleByIDHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		roleID := c.Params("id")
+		if roleID == "" {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Role ID is required"))
+		}
 
 		var role models.Role
 		if err := db.Where("id = ?", roleID).First(&role).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return responseHandler.Handle(c, nil, errors.New("role not found"))
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusNotFound, "Role not found"))
 			}
-			return responseHandler.Handle(c, nil, errors.New("failed to retrieve role"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusInternalServerError, "Failed to retrieve role"))
 		}
 
-		return responseHandler.Handle(c, fiber.Map{"role": role}, nil)
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"data": fiber.Map{
+				"role": role,
+			},
+		}, nil)
 	}
 }
 
@@ -121,17 +142,25 @@ func GetRoleByIDHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) 
 func UpdateRoleHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		roleID := c.Params("id")
+		if roleID == "" {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Role ID is required"))
+		}
+
 		var req UpdateRoleRequest
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.Handle(c, nil, errors.New("invalid request payload"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request payload"))
 		}
 
 		var role models.Role
 		if err := db.Where("id = ?", roleID).First(&role).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return responseHandler.Handle(c, nil, errors.New("role not found"))
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusNotFound, "Role not found"))
 			}
-			return responseHandler.Handle(c, nil, errors.New("failed to retrieve role"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusInternalServerError, "Failed to retrieve role"))
 		}
 
 		// Update role details if provided
@@ -144,10 +173,13 @@ func UpdateRoleHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) f
 		role.UpdatedAt = time.Now()
 
 		if err := db.Save(&role).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to update role"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusInternalServerError, "Failed to update role"))
 		}
 
-		return responseHandler.Handle(c, fiber.Map{"message": "Role updated successfully", "role": role}, nil)
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Role updated successfully",
+		}, nil)
 	}
 }
 
@@ -165,13 +197,19 @@ func UpdateRoleHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) f
 func ActivateRoleHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		roleID := c.Params("id")
+		if roleID == "" {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Role ID is required"))
+		}
 
 		var role models.Role
 		if err := db.Where("id = ?", roleID).First(&role).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return responseHandler.Handle(c, nil, errors.New("role not found"))
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusNotFound, "Role not found"))
 			}
-			return responseHandler.Handle(c, nil, errors.New("failed to retrieve role"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusInternalServerError, "Failed to retrieve role"))
 		}
 
 		// Set role as active
@@ -179,10 +217,13 @@ func ActivateRoleHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler)
 		role.UpdatedAt = time.Now()
 
 		if err := db.Save(&role).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to activate role"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusInternalServerError, "Failed to activate role"))
 		}
 
-		return responseHandler.Handle(c, fiber.Map{"message": "Role activated successfully", "role": role}, nil)
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Role activated successfully",
+		}, nil)
 	}
 }
 
@@ -200,13 +241,19 @@ func ActivateRoleHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler)
 func DeactivateRoleHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		roleID := c.Params("id")
+		if roleID == "" {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Role ID is required"))
+		}
 
 		var role models.Role
 		if err := db.Where("id = ?", roleID).First(&role).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return responseHandler.Handle(c, nil, errors.New("role not found"))
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusNotFound, "Role not found"))
 			}
-			return responseHandler.Handle(c, nil, errors.New("failed to retrieve role"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusInternalServerError, "Failed to retrieve role"))
 		}
 
 		// Set role as inactive
@@ -214,9 +261,12 @@ func DeactivateRoleHandler(db *gorm.DB, responseHandler *handlers.ResponseHandle
 		role.UpdatedAt = time.Now()
 
 		if err := db.Save(&role).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to deactivate role"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusInternalServerError, "Failed to deactivate role"))
 		}
 
-		return responseHandler.Handle(c, fiber.Map{"message": "Role deactivated successfully", "role": role}, nil)
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Role deactivated successfully",
+		}, nil)
 	}
 }

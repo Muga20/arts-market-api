@@ -1,7 +1,8 @@
 package account
 
 import (
-	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-playground/validator/v10"
@@ -38,60 +39,108 @@ type UpdateProfileRequest struct {
 // @Router /account/profile [put]
 func UpdateProfile(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		// Retrieve the user from the context set by AuthMiddleware
+		// Retrieve the user from context with proper type assertion
 		user, ok := c.Locals("user").(models.User)
 		if !ok {
-			return responseHandler.Handle(c, nil, errors.New("user not found in context"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
 
-		// Parse the request body
+		// Parse request body
 		var req UpdateProfileRequest
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.Handle(c, nil, errors.New("invalid request body"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request body"))
 		}
 
+		// Initialize validator
 		// Initialize validator
 		validate := validator.New()
 		if err := validate.Struct(req); err != nil {
 			validationErrors := err.(validator.ValidationErrors)
 			errorMessages := make(map[string]string)
+
 			for _, e := range validationErrors {
-				switch e.Field() {
-				case "FirstName":
-					errorMessages["first_name"] = "First name must be less than 100 characters"
-				case "MiddleName":
-					errorMessages["middle_name"] = "Middle name must be less than 100 characters"
-				case "LastName":
-					errorMessages["last_name"] = "Last name must be less than 100 characters"
-				case "Gender":
-					errorMessages["gender"] = "Gender must be less than 50 characters"
-				case "DateOfBirth":
-					errorMessages["date_of_birth"] = "Date of birth must be in YYYY-MM-DD format"
-				case "AboutTheUser":
-					errorMessages["about_the_user"] = "About the user must be less than 1000 characters"
-				case "Nickname":
-					errorMessages["nickname"] = "Nickname must be less than 100 characters"
-				case "PreferredPronouns":
-					errorMessages["preferred_pronouns"] = "Preferred pronouns must be less than 50 characters"
+				field := strings.ToLower(e.Field())
+				var message string
+
+				// Get the actual validation tag that failed (e.g., "max", "required")
+				switch e.Tag() {
+				case "required":
+					message = "This field is required"
+				case "max":
+					switch field {
+					case "firstname":
+						message = "First name cannot exceed 100 characters"
+					case "middlename":
+						message = "Middle name cannot exceed 100 characters"
+					case "lastname":
+						message = "Last name cannot exceed 100 characters"
+					case "gender":
+						message = "Gender cannot exceed 50 characters"
+					case "abouttheuser":
+						message = "About section cannot exceed 1000 characters"
+					case "nickname":
+						message = "Nickname cannot exceed 100 characters"
+					case "preferredpronouns":
+						message = "Preferred pronouns cannot exceed 50 characters"
+					default:
+						message = fmt.Sprintf("Cannot exceed %s characters", e.Param())
+					}
+				case "datetime":
+					if field == "dateofbirth" {
+						message = "Must be in YYYY-MM-DD format"
+					}
+				default:
+					message = fmt.Sprintf("Validation failed on %s rule", e.Tag())
 				}
+
+				// Convert field names to the JSON naming convention you use
+				jsonField := strings.ToLower(e.Field())
+				switch jsonField {
+				case "firstname":
+					jsonField = "first_name"
+				case "middlename":
+					jsonField = "middle_name"
+				case "lastname":
+					jsonField = "last_name"
+				case "dateofbirth":
+					jsonField = "date_of_birth"
+				case "abouttheuser":
+					jsonField = "about_the_user"
+				case "preferredpronouns":
+					jsonField = "preferred_pronouns"
+				}
+
+				errorMessages[jsonField] = message
 			}
-			return responseHandler.Handle(c, map[string]interface{}{
-				"error":  "validation failed",
-				"fields": errorMessages,
-			}, errors.New("validation failed"))
+
+			return responseHandler.HandleResponse(c, fiber.Map{
+				"message": "Validation failed",
+				"errors":  errorMessages,
+			}, fiber.NewError(fiber.StatusUnprocessableEntity, "Validation failed"))
+		}
+
+		// Start database transaction
+		tx := db.Begin()
+		if tx.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to start transaction: %w", tx.Error))
 		}
 
 		// Fetch or create UserDetail
 		var userDetail models.UserDetail
-		if err := db.Where("user_id = ?", user.ID).First(&userDetail).Error; err != nil {
+		if err := tx.Where("user_id = ?", user.ID).First(&userDetail).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
-				userDetail = models.UserDetail{UserID: user.ID} // Initialize with UserID
+				userDetail = models.UserDetail{UserID: user.ID}
 			} else {
-				return responseHandler.Handle(c, nil, err)
+				tx.Rollback()
+				return responseHandler.HandleResponse(c, nil,
+					fmt.Errorf("failed to fetch user details: %w", err))
 			}
 		}
 
-		// Update UserDetail fields if provided
+		// Update fields
 		if req.FirstName != "" {
 			userDetail.FirstName = req.FirstName
 		}
@@ -108,7 +157,9 @@ func UpdateProfile(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber
 			if parsedDate, err := time.Parse("2006-01-02", *req.DateOfBirth); err == nil {
 				userDetail.DateOfBirth = &parsedDate
 			} else {
-				return responseHandler.Handle(c, nil, errors.New("invalid date_of_birth format, use YYYY-MM-DD"))
+				tx.Rollback()
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusBadRequest, "Invalid date_of_birth format, use YYYY-MM-DD"))
 			}
 		}
 		if req.AboutTheUser != nil {
@@ -124,14 +175,21 @@ func UpdateProfile(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber
 			userDetail.PreferredPronouns = req.PreferredPronouns
 		}
 
-		// Save UserDetail (create or update)
-		if err := db.Save(&userDetail).Error; err != nil {
-			return responseHandler.Handle(c, nil, err)
+		// Save changes
+		if err := tx.Save(&userDetail).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to update profile: %w", err))
 		}
 
-		// Return success message
-		return responseHandler.Handle(c, map[string]string{
-			"message": "updated successfully",
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to commit transaction: %w", err))
+		}
+
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Profile updated successfully",
 		}, nil)
 	}
 }

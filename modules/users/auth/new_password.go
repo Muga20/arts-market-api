@@ -2,6 +2,7 @@ package auth
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -33,47 +34,84 @@ func ResetPasswordHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler
 	return func(c *fiber.Ctx) error {
 		var req ResetPassword
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.Handle(c, nil, errors.New("invalid request payload"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request payload"))
 		}
 
 		// Validate token format (UUID)
 		if !validation.IsValidUUID(req.Token) {
-			return responseHandler.Handle(c, nil, errors.New("invalid reset token format"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid reset token format"))
 		}
 
-		// Retrieve user security by reset token
+		// Start database transaction
+		tx := db.Begin()
+		if tx.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to start transaction: %w", tx.Error))
+		}
+
+		// Retrieve user security by reset token with row locking
 		var userSecurity models.UserSecurity
-		if err := db.Where("password_reset_token = ?", req.Token).First(&userSecurity).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("invalid reset token"))
+		if err := tx.Set("gorm:query_option", "FOR UPDATE").
+			Where("password_reset_token = ?", req.Token).
+			First(&userSecurity).Error; err != nil {
+			tx.Rollback()
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusNotFound, "Invalid reset token"))
+			}
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to retrieve user security: %w", err))
 		}
 
 		// Check if token has expired
-		if userSecurity.PasswordResetExpiresAt.Before(time.Now()) {
-			return responseHandler.Handle(c, nil, errors.New("reset token has expired"))
+		if userSecurity.PasswordResetExpiresAt == nil || userSecurity.PasswordResetExpiresAt.Before(time.Now()) {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusGone, "Reset token has expired"))
 		}
 
 		// Validate password strength
 		if !validation.IsValidPassword(req.Password) {
-			return responseHandler.Handle(c, nil, errors.New("password does not meet complexity requirements"))
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Password must contain at least 8 characters, including uppercase, lowercase, number, and special character"))
 		}
 
 		// Hash the new password
 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 		if err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to hash password"))
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to hash password: %w", err))
 		}
 
-		// Update the user's password and clear the reset token
+		// Update user security
 		userSecurity.Password = string(hashedPassword)
 		userSecurity.PasswordResetToken = nil
 		userSecurity.PasswordResetExpiresAt = nil
+		userSecurity.UpdatedAt = time.Now()
 
-		if err := db.Save(&userSecurity).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to update password"))
+		if err := tx.Save(&userSecurity).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to update password: %w", err))
 		}
 
-		return responseHandler.Handle(c, fiber.Map{
-			"message": "Password successfully reset",
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to commit transaction: %w", err))
+		}
+
+		// Invalidate all active sessions for this user
+		if err := db.Where("user_id = ?", userSecurity.UserID).
+			Delete(&models.UserSession{}).Error; err != nil {
+		}
+
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Password successfully reset. All active sessions have been terminated.",
 		}, nil)
 	}
 }

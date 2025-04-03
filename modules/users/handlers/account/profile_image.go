@@ -3,6 +3,7 @@ package account
 import (
 	"fmt"
 	"log"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/muga20/artsMarket/config"
@@ -26,76 +27,101 @@ import (
 // @Router /account/image [put]
 func UpdateUserImage(db *gorm.DB, cld *config.CloudinaryClient, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		userID := c.Locals("user").(models.User)
+		// Authentication check with proper type assertion
+		user, ok := c.Locals("user").(models.User)
+		if !ok {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
+		}
 
 		// Validate image type
 		imageType := c.FormValue("type") // "profile" or "cover"
 		if imageType != "profile" && imageType != "cover" {
-			return responseHandler.HandleResponse(c, map[string]interface{}{
-				"success": false, "message": "Invalid image type, must be 'profile' or 'cover'",
-			}, fmt.Errorf("invalid image type"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid image type, must be 'profile' or 'cover'"))
 		}
 
 		// Handle image file
 		file, err := c.FormFile("image")
 		if err != nil {
-			return responseHandler.HandleResponse(c, map[string]interface{}{
-				"success": false, "message": "No image file provided",
-			}, fmt.Errorf("no image file provided"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "No image file provided"))
+		}
+
+		// Validate file size and type
+		if file.Size > 5<<20 { // 5MB limit
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Image too large, maximum size is 5MB"))
+		}
+
+		if !strings.HasPrefix(file.Header.Get("Content-Type"), "image/") {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Only image files are allowed"))
 		}
 
 		// Upload to Cloudinary
-		fileURL, err := cld.UploadFile(file, userID.ID.String())
+		fileURL, err := cld.UploadFile(file, user.ID.String())
 		if err != nil {
-			log.Println("Failed to upload to Cloudinary:", err)
-			return responseHandler.HandleResponse(c, map[string]interface{}{
-				"success": false, "message": "Failed to upload image",
-			}, fmt.Errorf("failed to upload image"))
+			log.Printf("Cloudinary upload failed: %v", err)
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusInternalServerError, "Failed to upload image"))
+		}
+
+		// Start database transaction
+		tx := db.Begin()
+		if tx.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to start transaction: %w", tx.Error))
 		}
 
 		// Check if user details exist
 		var userDetail models.UserDetail
-		if err := db.Where("user_id = ?", userID.ID).First(&userDetail).Error; err != nil {
-			if err == gorm.ErrRecordNotFound {
-				// Create a new user detail record if not found
-				userDetail = models.UserDetail{
-					UserID: userID.ID,
-				}
-				if imageType == "profile" {
-					userDetail.ProfileImage = fileURL
-				} else {
-					userDetail.CoverImage = fileURL
-				}
+		err = tx.Where("user_id = ?", user.ID).First(&userDetail).Error
 
-				if err := db.Create(&userDetail).Error; err != nil {
-					return responseHandler.HandleResponse(c, map[string]interface{}{
-						"success": false, "message": "Failed to create user details",
-					}, fmt.Errorf("failed to create user details"))
-				}
-			} else {
-				return responseHandler.HandleResponse(c, map[string]interface{}{
-					"success": false, "message": "User details lookup failed",
-				}, err)
+		if err == gorm.ErrRecordNotFound {
+			// Create new record if not found
+			userDetail = models.UserDetail{
+				UserID: user.ID,
 			}
-		} else {
-			// Update the correct image field
 			if imageType == "profile" {
 				userDetail.ProfileImage = fileURL
 			} else {
 				userDetail.CoverImage = fileURL
 			}
 
-			// Save user details to the database
-			if err := db.Save(&userDetail).Error; err != nil {
-				return responseHandler.HandleResponse(c, map[string]interface{}{
-					"success": false, "message": "Failed to update user image",
-				}, fmt.Errorf("failed to update user image"))
+			if err := tx.Create(&userDetail).Error; err != nil {
+				tx.Rollback()
+				return responseHandler.HandleResponse(c, nil,
+					fmt.Errorf("failed to create user details: %w", err))
+			}
+		} else if err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to fetch user details: %w", err))
+		} else {
+			// Update existing record
+			if imageType == "profile" {
+				userDetail.ProfileImage = fileURL
+			} else {
+				userDetail.CoverImage = fileURL
+			}
+
+			if err := tx.Save(&userDetail).Error; err != nil {
+				tx.Rollback()
+				return responseHandler.HandleResponse(c, nil,
+					fmt.Errorf("failed to update user image: %w", err))
 			}
 		}
 
-		// Return success response
-		return responseHandler.HandleResponse(c, map[string]interface{}{
-			"success": true, "message": "Image updated successfully", "url": fileURL,
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to commit transaction: %w", err))
+		}
+
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Image updated successfully",
+			"url":     fileURL,
 		}, nil)
 	}
 }
@@ -114,32 +140,43 @@ func UpdateUserImage(db *gorm.DB, cld *config.CloudinaryClient, responseHandler 
 // @Router /account/image [delete]
 func RemoveUserImage(db *gorm.DB, cld *config.CloudinaryClient, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		userID := c.Locals("user").(models.User)
-		imageType := c.Query("type")
-		// Validate image type
-		if imageType != "profile" && imageType != "cover" {
-			return responseHandler.HandleResponse(c, map[string]interface{}{
-				"success": false, "message": "Invalid image type, must be 'profile' or 'cover'",
-			}, fmt.Errorf("invalid image type, must be 'profile' or 'cover'"))
+		// Authentication check with proper type assertion
+		user, ok := c.Locals("user").(models.User)
+		if !ok {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
 
-		// Get user details from the database
-		var userDetail models.UserDetail
-		err := db.Where("user_id = ?", userID.ID).First(&userDetail).Error
+		// Validate image type
+		imageType := c.Query("type")
+		if imageType != "profile" && imageType != "cover" {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid image type, must be 'profile' or 'cover'"))
+		}
 
-		// If user details are not found, create a new one
+		// Start database transaction
+		tx := db.Begin()
+		if tx.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to start transaction: %w", tx.Error))
+		}
+
+		// Get or create user details
+		var userDetail models.UserDetail
+		err := tx.Where("user_id = ?", user.ID).First(&userDetail).Error
+
 		if err == gorm.ErrRecordNotFound {
-			userDetail = models.UserDetail{UserID: userID.ID}
-			if err := db.Create(&userDetail).Error; err != nil {
-				return responseHandler.HandleResponse(c, map[string]interface{}{
-					"success": false, "message": "Failed to create user details",
-				}, fmt.Errorf("failed to create user details"))
+			// Create new record if not found
+			userDetail = models.UserDetail{UserID: user.ID}
+			if err := tx.Create(&userDetail).Error; err != nil {
+				tx.Rollback()
+				return responseHandler.HandleResponse(c, nil,
+					fmt.Errorf("failed to create user details: %w", err))
 			}
 		} else if err != nil {
-			// Handle other potential errors
-			return responseHandler.HandleResponse(c, map[string]interface{}{
-				"success": false, "message": "Error retrieving user details",
-			}, err)
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to fetch user details: %w", err))
 		}
 
 		// Determine which image field to clear
@@ -152,24 +189,30 @@ func RemoveUserImage(db *gorm.DB, cld *config.CloudinaryClient, responseHandler 
 			userDetail.CoverImage = ""
 		}
 
-		// Save user details after removing image
-		if err := db.Save(&userDetail).Error; err != nil {
-			return responseHandler.HandleResponse(c, map[string]interface{}{
-				"success": false, "message": "Failed to update database",
-			}, fmt.Errorf("failed to update database"))
+		// Save updated user details
+		if err := tx.Save(&userDetail).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to update user details: %w", err))
 		}
 
-		// Remove image from Cloudinary
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to commit transaction: %w", err))
+		}
+
+		// Delete from Cloudinary (non-blocking)
 		if filePath != "" {
-			if err := cld.DeleteFile(filePath); err != nil {
-				log.Println("Failed to delete from Cloudinary:", err)
-				// Continue execution even if delete fails
-			}
+			go func() {
+				if err := cld.DeleteFile(filePath); err != nil {
+					log.Printf("Failed to delete image from Cloudinary: %v (path: %s)", err, filePath)
+				}
+			}()
 		}
 
-		// Return success response
-		return responseHandler.HandleResponse(c, map[string]interface{}{
-			"success": true, "message": "Image removed successfully",
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Image removed successfully",
 		}, nil)
 	}
 }

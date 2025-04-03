@@ -2,6 +2,7 @@ package auth
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -36,64 +37,85 @@ func ResetPasswordRequestHandler(db *gorm.DB, responseHandler *handlers.Response
 	return func(c *fiber.Ctx) error {
 		var req ResetPasswordRequest
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.Handle(c, nil, errors.New("invalid request payload"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request payload"))
 		}
 
 		// Validate email format
 		if !validation.IsValidEmail(req.Email) {
-			return responseHandler.Handle(c, nil, errors.New("invalid email format"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid email format"))
 		}
 
-		// Rate-limiting: Prevent multiple password reset requests in a short period
+		// Rate-limiting
 		if utils.IsRateLimited(req.Email) {
-			return responseHandler.Handle(c, nil, errors.New("too many password reset attempts. Please try again later"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusTooManyRequests, "Too many password reset attempts. Please try again later"))
 		}
 
 		// Retrieve user by email
 		var user models.User
 		if err := db.Where("email = ?", req.Email).First(&user).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				// Do not disclose whether the email exists for security reasons
-				return responseHandler.Handle(c, nil, errors.New("password reset request received"))
+				// Security: Always return same message whether user exists or not
+				return responseHandler.HandleResponse(c, fiber.Map{
+					"message": "If an account exists with this email, a password reset link has been sent",
+				}, nil)
 			}
-			return responseHandler.Handle(c, nil, errors.New("failed to retrieve user"))
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to retrieve user: %w", err))
 		}
 
 		// Generate password reset token
 		resetToken := uuid.New().String()
 		resetTokenExpiry := time.Now().Add(time.Hour * 1)
 
-		// Update user security record with the reset token and expiry
-		var userSecurity models.UserSecurity
-		if err := db.Where("user_id = ?", user.ID).First(&userSecurity).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to retrieve user security information"))
+		// Start transaction
+		tx := db.Begin()
+		if tx.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to start transaction: %w", tx.Error))
 		}
 
-		// Update the reset token in the database
+		// Update user security record
+		var userSecurity models.UserSecurity
+		if err := tx.Where("user_id = ?", user.ID).First(&userSecurity).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to retrieve user security information: %w", err))
+		}
+
 		userSecurity.PasswordResetToken = &resetToken
 		userSecurity.PasswordResetExpiresAt = &resetTokenExpiry
-		if err := db.Save(&userSecurity).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to update reset token"))
+		if err := tx.Save(&userSecurity).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to update reset token: %w", err))
 		}
 
-		// Queue the email task instead of sending it directly
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to commit transaction: %w", err))
+		}
+
+		// Queue email task
 		task, err := tasks.NewSendEmailTask(req.Email, resetToken)
 		if err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to create email task"))
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to create email task: %w", err))
 		}
 
-		// Connect to Redis using the centralized config (using the already established Redis client)
 		client := asynq.NewClient(*config.RedisConfig)
 		defer client.Close()
 
-		// Enqueue the task for background processing
-		_, err = client.Enqueue(task)
-		if err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to enqueue email task"))
+		if _, err := client.Enqueue(task); err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to enqueue email task: %w", err))
 		}
 
-		return responseHandler.Handle(c, fiber.Map{
-			"message": "Password reset token sent to your email",
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "If an account exists with this email, a password reset link has been sent",
 		}, nil)
 	}
 }

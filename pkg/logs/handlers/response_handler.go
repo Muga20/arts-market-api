@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"log"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -27,77 +28,121 @@ type callerInfo struct {
 
 type ResponseHandler struct {
 	logService *logs.LogService
+	env        string // "development" or "production"
 }
 
 func NewResponseHandler(db *gorm.DB) *ResponseHandler {
+	env := os.Getenv("APP_ENV")
+	if env == "" {
+		env = "development"
+	}
+
 	return &ResponseHandler{
 		logService: logs.NewLogService(db),
+		env:        env,
 	}
 }
 
 type Response struct {
 	Success bool        `json:"success"`
-	Data    interface{} `json:"data,omitempty"`
-	Error   string      `json:"error,omitempty"`
+	Message string      `json:"message,omitempty"` // User-friendly message
+	Data    interface{} `json:"data,omitempty"`    // Only for successful responses
 }
 
 func (h *ResponseHandler) HandleResponse(c *fiber.Ctx, data interface{}, err error) error {
+	// Handle error cases first
 	if err != nil {
-		// Get caller info
-		file, method, line := h.getCachedCaller()
-
-		// Capture context values before spawning goroutine
-		errorDetails := &errorContext{
-			message:    err.Error(),
-			file:       file,
-			method:     method,
-			line:       line,
-			ip:         c.IP(),
-			userAgent:  c.Get("User-Agent"),
-			occurredAt: time.Now(),
-		}
-
-		// Async logging with captured values
-		go h.safeLogError(errorDetails) // Called from HandleResponse
-
-		return c.Status(fiber.StatusInternalServerError).JSON(Response{
-			Success: false,
-			Error:   err.Error(),
-		})
+		return h.handleError(c, err)
 	}
 
-	return c.JSON(Response{
+	// Handle success case
+	return c.Status(fiber.StatusOK).JSON(Response{
 		Success: true,
 		Data:    data,
 	})
 }
 
-type errorContext struct {
-	message    string
-	file       string
-	method     string
-	line       int
-	ip         string
-	userAgent  string
-	occurredAt time.Time
+func (h *ResponseHandler) handleError(c *fiber.Ctx, err error) error {
+	// Log the error with context
+	h.logError(c, err)
+
+	// Determine status code and message
+	status := fiber.StatusInternalServerError
+	message := "Something went wrong"
+
+	switch e := err.(type) {
+	case *fiber.Error:
+		status = e.Code
+		message = e.Message
+	default:
+		// For non-fiber errors in production, use generic message
+		if h.env != "development" {
+			message = "An unexpected error occurred"
+		} else {
+			message = err.Error()
+		}
+	}
+
+	return c.Status(status).JSON(Response{
+		Success: false,
+		Message: message,
+	})
 }
 
-func (h *ResponseHandler) safeLogError(ctx *errorContext) {
-	errLog := &models.ErrorLog{
-		Level:      "error",
-		Message:    ctx.message,
-		FileName:   ctx.file,
-		MethodName: ctx.method,
-		LineNumber: ctx.line,
-		IPAddress:  ctx.ip,
-		UserAgent:  ctx.userAgent,
-		OccurredAt: ctx.occurredAt,
+func (h *ResponseHandler) logError(c *fiber.Ctx, err error) {
+	if err == nil {
+		return
 	}
 
-	if logErr := h.logService.CreateErrorLog(errLog); logErr != nil {
-		log.Printf("Failed to log error: %v (Original error: %v at %s:%s:%d)",
-			logErr, ctx.message, ctx.file, ctx.method, ctx.line)
+	// Extract all needed values from context BEFORE goroutine
+	var ip, userAgent string
+	if c != nil {
+		ip = c.IP()
+		userAgent = c.Get("User-Agent")
+	} else {
+		ip = "unknown"
+		userAgent = "unknown"
 	}
+
+	// Get caller info synchronously
+	pc, file, line, _ := runtime.Caller(3)
+	fn := runtime.FuncForPC(pc)
+	funcName := "unknown"
+	if fn != nil {
+		funcName = fn.Name()
+		// Simplify function name
+		if lastSlash := strings.LastIndex(funcName, "/"); lastSlash >= 0 {
+			funcName = funcName[lastSlash+1:]
+		}
+		if dot := strings.LastIndex(funcName, "."); dot >= 0 {
+			funcName = funcName[dot+1:]
+		}
+	}
+
+	// Create error log in goroutine but with all values captured
+	go func(ip, userAgent, file, funcName string, line int) {
+		errLog := &models.ErrorLog{
+			Level:      "error",
+			Message:    err.Error(),
+			FileName:   filepath.Base(file),
+			MethodName: funcName,
+			LineNumber: line,
+			IPAddress:  ip,
+			UserAgent:  userAgent,
+			OccurredAt: time.Now(),
+			StackTrace: h.getStackTrace(),
+		}
+
+		if logErr := h.logService.CreateErrorLog(errLog); logErr != nil {
+			log.Printf("Failed to log error: %v", logErr)
+		}
+	}(ip, userAgent, file, funcName, line)
+}
+
+func (h *ResponseHandler) getStackTrace() string {
+	buf := make([]byte, 4096)
+	n := runtime.Stack(buf, false)
+	return string(buf[:n])
 }
 
 func (h *ResponseHandler) getCachedCaller() (file, method string, line int) {

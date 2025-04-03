@@ -2,6 +2,7 @@ package auth
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -35,29 +36,41 @@ func SignupHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber
 	return func(c *fiber.Ctx) error {
 		var req SignupRequest
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.Handle(c, nil, errors.New("invalid request payload"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request payload"))
 		}
 
-		// Validate email format using validation package
+		// Validate email format
 		if !validation.IsValidEmail(req.Email) {
-			return responseHandler.Handle(c, nil, errors.New("invalid email format"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid email format"))
 		}
 
 		// Validate password strength
 		if !validation.IsValidPassword(req.Password) {
-			return responseHandler.Handle(c, nil, errors.New("password must contain at least 8 characters, including an uppercase letter, a lowercase letter, a number, and a special character"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Password must contain at least 8 characters, including an uppercase letter, a lowercase letter, a number, and a special character"))
 		}
 
 		// Check if user already exists
 		var existingUser models.User
 		if err := db.Where("email = ?", req.Email).First(&existingUser).Error; err == nil {
-			return responseHandler.Handle(c, nil, errors.New("user already exists"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusConflict, "User already exists"))
 		}
 
-		// Generate unique username based on email
+		// Generate unique username
 		username, err := generateUniqueUsername(db, req.Email)
 		if err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to generate unique username"))
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to generate unique username: %w", err))
+		}
+
+		// Start transaction
+		tx := db.Begin()
+		if tx.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to start transaction: %w", tx.Error))
 		}
 
 		// Create new user
@@ -72,55 +85,66 @@ func SignupHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber
 			UpdatedAt: time.Now(),
 		}
 
-		if err := db.Create(&newUser).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to create user"))
+		if err := tx.Create(&newUser).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to create user: %w", err))
 		}
 
 		// Hash password
 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 		if err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to hash password"))
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to hash password: %w", err))
 		}
 
-		// Store password in UserSecurity table
+		// Store password
 		userSecurity := models.UserSecurity{
 			ID:       uuid.New(),
 			UserID:   newUser.ID,
 			Password: string(hashedPassword),
 		}
 
-		if err := db.Create(&userSecurity).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to store user security data"))
+		if err := tx.Create(&userSecurity).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to store user security data: %w", err))
 		}
 
-		// Assign default "user" role
-		if err := assignUserRole(db, newUser.ID); err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to assign user role"))
+		// Assign default role
+		if err := assignUserRole(tx, newUser.ID); err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to assign user role: %w", err))
 		}
 
-		return responseHandler.Handle(c, fiber.Map{"message": "User created successfully"}, nil)
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to commit transaction: %w", err))
+		}
+
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "User created successfully",
+		}, nil)
 	}
 }
 
-// generateUniqueUsername generates a unique username based on email
 func generateUniqueUsername(db *gorm.DB, email string) (string, error) {
-	baseUsername := strings.ToLower(strings.Split(email, "@")[0]) // Get the part before the "@" in the email
+	baseUsername := strings.ToLower(strings.Split(email, "@")[0])
 
-	// Check if the username is already taken
 	var user models.User
 	if err := db.Where("username = ?", baseUsername).First(&user).Error; err == nil {
-		// If username is taken, append a unique UUID to it
 		baseUsername = baseUsername + "-" + uuid.New().String()[:8]
 	}
 
 	return baseUsername, nil
 }
 
-// assignUserRole assigns the "user" role to a new user
 func assignUserRole(db *gorm.DB, userID uuid.UUID) error {
 	var role models.Role
 	if err := db.Where("role_name = ?", "user").First(&role).Error; errors.Is(err, gorm.ErrRecordNotFound) {
-		// If role doesn't exist, create it
 		role = models.Role{
 			ID:         uuid.New(),
 			RoleName:   "user",
@@ -130,11 +154,10 @@ func assignUserRole(db *gorm.DB, userID uuid.UUID) error {
 			UpdatedAt:  time.Now(),
 		}
 		if err := db.Create(&role).Error; err != nil {
-			return err
+			return fmt.Errorf("failed to create role: %w", err)
 		}
 	}
 
-	// Assign role to user
 	userRole := models.UserRole{
 		ID:       uuid.New(),
 		UserID:   userID,
@@ -142,5 +165,9 @@ func assignUserRole(db *gorm.DB, userID uuid.UUID) error {
 		IsActive: true,
 	}
 
-	return db.Create(&userRole).Error
+	if err := db.Create(&userRole).Error; err != nil {
+		return fmt.Errorf("failed to assign role: %w", err)
+	}
+
+	return nil
 }

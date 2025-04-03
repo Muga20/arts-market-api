@@ -1,7 +1,8 @@
 package account
 
 import (
-	"errors"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -34,10 +35,6 @@ type ProfileResponse struct {
 		City    string `json:"city,omitempty"`
 		Zip     string `json:"zip,omitempty"`
 	} `json:"location,omitempty"`
-	SocialLinks []struct {
-		Platform string `json:"platform"`
-		Link     string `json:"link"`
-	} `json:"social_links,omitempty"`
 	Roles []struct {
 		RoleName string `json:"role_name"`
 		IsActive bool   `json:"is_active"`
@@ -56,108 +53,124 @@ type ProfileResponse struct {
 // @Router /account/profile [get]
 func ProfileHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		// Retrieve the user from the context set by the AuthMiddleware
+		// Authentication check with proper type assertion
 		user, ok := c.Locals("user").(models.User)
 		if !ok {
-			return responseHandler.Handle(c, nil, errors.New("user not found in context"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
 
-		// Fetch UserDetail, UserLocation, SocialLinks, and UserRoles with selective attributes
+		// Use separate database connections for parallel queries
+		dbUserDetail := db.Session(&gorm.Session{})
+		dbUserLocation := db.Session(&gorm.Session{})
+		dbSocialLinks := db.Session(&gorm.Session{})
+		dbUserRoles := db.Session(&gorm.Session{})
+
+		// Parallel execution with error channel
+		errChan := make(chan error, 4)
+		var wg sync.WaitGroup
+		wg.Add(4)
+
+		// Fetch user details
 		var userDetail models.UserDetail
-		if err := db.Model(&models.UserDetail{}).
-			Select("id", "user_id", "first_name", "middle_name", "last_name", "gender", "date_of_birth",
-				"profile_image", "cover_image", "about_the_user", "is_profile_public", "nickname", "preferred_pronouns").
-			Where("user_id = ?", user.ID).
-			First(&userDetail).Error; err != nil && err != gorm.ErrRecordNotFound {
-			return responseHandler.Handle(c, nil, err)
-		}
+		go func() {
+			defer wg.Done()
+			if err := dbUserDetail.Model(&models.UserDetail{}).
+				Select("first_name", "middle_name", "last_name", "gender", "date_of_birth",
+					"profile_image", "cover_image", "about_the_user", "is_profile_public",
+					"nickname", "preferred_pronouns").
+				Where("user_id = ?", user.ID).
+				First(&userDetail).Error; err != nil && err != gorm.ErrRecordNotFound {
+				errChan <- fmt.Errorf("failed to fetch user details: %w", err)
+			}
+		}()
 
+		// Fetch user location
 		var userLocation models.UserLocation
-		if err := db.Model(&models.UserLocation{}).
-			Select("country", "state", "city", "zip").
-			Where("user_id = ?", user.ID).
-			First(&userLocation).Error; err != nil && err != gorm.ErrRecordNotFound {
-			return responseHandler.Handle(c, nil, err)
-		}
+		go func() {
+			defer wg.Done()
+			if err := dbUserLocation.Model(&models.UserLocation{}).
+				Select("country", "state", "city", "zip").
+				Where("user_id = ?", user.ID).
+				First(&userLocation).Error; err != nil && err != gorm.ErrRecordNotFound {
+				errChan <- fmt.Errorf("failed to fetch user location: %w", err)
+			}
+		}()
 
+		// Fetch social links
 		var socialLinks []models.SocialLink
-		if err := db.Model(&models.SocialLink{}).
-			Select("platform", "link").
-			Where("user_id = ?", user.ID).
-			Find(&socialLinks).Error; err != nil {
-			return responseHandler.Handle(c, nil, err)
-		}
+		go func() {
+			defer wg.Done()
+			if err := dbSocialLinks.Model(&models.SocialLink{}).
+				Select("platform", "link").
+				Where("user_id = ?", user.ID).
+				Find(&socialLinks).Error; err != nil {
+				errChan <- fmt.Errorf("failed to fetch social links: %w", err)
+			}
+		}()
 
-		var userRoles []models.UserRole
-		if err := db.Model(&models.UserRole{}).
-			Select("user_roles.role_id", "user_roles.is_active", "roles.role_name").
-			Joins("JOIN roles ON roles.id = user_roles.role_id").
-			Where("user_roles.user_id = ?", user.ID).
-			Find(&userRoles).Error; err != nil {
-			return responseHandler.Handle(c, nil, err)
+		// Fetch user roles with role names
+		var userRoles []struct {
+			RoleID   uuid.UUID
+			RoleName string
+			IsActive bool
+		}
+		go func() {
+			defer wg.Done()
+			if err := dbUserRoles.Model(&models.UserRole{}).
+				Select("user_roles.role_id", "roles.role_name", "user_roles.is_active").
+				Joins("JOIN roles ON roles.id = user_roles.role_id").
+				Where("user_roles.user_id = ?", user.ID).
+				Find(&userRoles).Error; err != nil {
+				errChan <- fmt.Errorf("failed to fetch user roles: %w", err)
+			}
+		}()
+
+		wg.Wait()
+		close(errChan)
+
+		// Check for errors
+		for e := range errChan {
+			if e != nil {
+				return responseHandler.HandleResponse(c, nil, e)
+			}
 		}
 
 		// Construct the profile response
-		profileResponse := ProfileResponse{
-			ID:                user.ID,
-			Email:             user.Email,
-			Username:          user.Username,
-			Status:            user.Status,
-			IsActive:          user.IsActive,
-			FirstName:         userDetail.FirstName,
-			MiddleName:        userDetail.MiddleName,
-			LastName:          userDetail.LastName,
-			Gender:            userDetail.Gender,
-			DateOfBirth:       userDetail.DateOfBirth,
-			ProfileImage:      userDetail.ProfileImage,
-			CoverImage:        userDetail.CoverImage,
-			AboutTheUser:      userDetail.AboutTheUser,
-			IsProfilePublic:   userDetail.IsProfilePublic,
-			Nickname:          userDetail.Nickname,
-			PreferredPronouns: userDetail.PreferredPronouns,
-			Location: struct {
-				Country string `json:"country,omitempty"`
-				State   string `json:"state,omitempty"`
-				City    string `json:"city,omitempty"`
-				Zip     string `json:"zip,omitempty"`
-			}{
-				Country: userLocation.Country,
-				State:   userLocation.State,
-				City:    userLocation.City,
-				Zip:     userLocation.Zip,
+		profileResponse := fiber.Map{
+			"id":                 user.ID,
+			"email":              user.Email,
+			"username":           user.Username,
+			"status":             user.Status,
+			"is_active":          user.IsActive,
+			"first_name":         userDetail.FirstName,
+			"middle_name":        userDetail.MiddleName,
+			"last_name":          userDetail.LastName,
+			"gender":             userDetail.Gender,
+			"date_of_birth":      userDetail.DateOfBirth,
+			"profile_image":      userDetail.ProfileImage,
+			"cover_image":        userDetail.CoverImage,
+			"about_the_user":     userDetail.AboutTheUser,
+			"is_profile_public":  userDetail.IsProfilePublic,
+			"nickname":           userDetail.Nickname,
+			"preferred_pronouns": userDetail.PreferredPronouns,
+			"location": fiber.Map{
+				"country": userLocation.Country,
+				"state":   userLocation.State,
+				"city":    userLocation.City,
+				"zip":     userLocation.Zip,
 			},
-		}
-
-		// Populate social links
-		for _, sl := range socialLinks {
-			profileResponse.SocialLinks = append(profileResponse.SocialLinks, struct {
-				Platform string `json:"platform"`
-				Link     string `json:"link"`
-			}{
-				Platform: sl.Platform,
-				Link:     sl.Link,
-			})
+			"roles": make([]fiber.Map, 0, len(userRoles)),
 		}
 
 		// Populate roles
 		for _, ur := range userRoles {
-			var role models.Role
-			if err := db.Model(&models.Role{}).
-				Select("role_name").
-				Where("id = ?", ur.RoleID).
-				First(&role).Error; err != nil {
-				return responseHandler.Handle(c, nil, err)
-			}
-			profileResponse.Roles = append(profileResponse.Roles, struct {
-				RoleName string `json:"role_name"`
-				IsActive bool   `json:"is_active"`
-			}{
-				RoleName: role.RoleName,
-				IsActive: ur.IsActive,
+			profileResponse["roles"] = append(profileResponse["roles"].([]fiber.Map), fiber.Map{
+				"role_name": ur.RoleName,
+				"is_active": ur.IsActive,
 			})
 		}
 
-		// Return the profile response
-		return responseHandler.Handle(c, profileResponse, nil)
+		return responseHandler.HandleResponse(c, profileResponse, nil)
 	}
 }

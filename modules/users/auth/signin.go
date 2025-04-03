@@ -2,6 +2,7 @@ package auth
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -46,22 +47,27 @@ func LoginHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.
 	return func(c *fiber.Ctx) error {
 		var req LoginRequest
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.Handle(c, nil, errors.New("invalid request payload"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request payload"))
 		}
 
-		// Validate email format using validation package
+		// Validate email format
 		if !validation.IsValidEmail(req.Email) {
-			return responseHandler.Handle(c, nil, errors.New("invalid email format"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid email format"))
 		}
+
 		// Prevent SQL Injection
 		if containsSQLInjection(req.Email) || containsSQLInjection(req.Password) {
-			return responseHandler.Handle(c, nil, errors.New("invalid request payload"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request payload"))
 		}
 
 		// Check if IP exceeded login attempt limit
 		ipAddress := c.IP()
 		if failedLoginAttempts[ipAddress] >= maxFailedLoginAttempts {
-			return responseHandler.Handle(c, nil, errors.New("too many failed login attempts, try again later"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusTooManyRequests, "Too many failed login attempts, try again later"))
 		}
 
 		// Retrieve user by email
@@ -69,44 +75,50 @@ func LoginHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.
 		if err := db.Where("email = ?", req.Email).First(&user).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				failedLoginAttempts[ipAddress]++
-				return responseHandler.Handle(c, nil, errors.New("invalid credentials"))
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusUnauthorized, "Invalid credentials"))
 			}
-			return responseHandler.Handle(c, nil, errors.New("failed to retrieve user"))
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to retrieve user: %w", err))
 		}
 
 		// Retrieve user's security information
 		var userSecurity models.UserSecurity
 		if err := db.Where("user_id = ?", user.ID).First(&userSecurity).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to retrieve user security information"))
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to retrieve user security information: %w", err))
 		}
 
-		// Compare the provided password with the stored hashed password
+		// Compare passwords
 		if err := bcrypt.CompareHashAndPassword([]byte(userSecurity.Password), []byte(req.Password)); err != nil {
 			failedLoginAttempts[ipAddress]++
-			return responseHandler.Handle(c, nil, errors.New("invalid credentials"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Invalid credentials"))
 		}
 
-		// Check if there are any active sessions for the user
+		// Check active sessions
 		var activeSessions []models.UserSession
 		if err := db.Where("user_id = ? AND session_token != ?", user.ID, "").Find(&activeSessions).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to retrieve active sessions"))
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to retrieve active sessions: %w", err))
 		}
 
-		// If there's an active session from a different device, block login
 		if len(activeSessions) > 0 {
-			return responseHandler.Handle(c, nil, errors.New("user already logged in from another device"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusConflict, "User already logged in from another device"))
 		}
 
-		// Reset failed login attempts on successful login
+		// Reset failed attempts
 		failedLoginAttempts[ipAddress] = 0
 
 		// Generate JWT token
 		token, err := generateJWT(user.ID)
 		if err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to generate JWT token"))
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to generate JWT token: %w", err))
 		}
 
-		// Set the JWT token as an HTTP-only cookie
+		// Set cookie
 		c.Cookie(&fiber.Cookie{
 			Name:     "auth_token",
 			Value:    token,
@@ -116,7 +128,7 @@ func LoginHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.
 			SameSite: fiber.CookieSameSiteStrictMode,
 		})
 
-		// Create or update session in the UserSession table
+		// Create session
 		session := models.UserSession{
 			ID:           uuid.New(),
 			UserID:       user.ID,
@@ -128,10 +140,11 @@ func LoginHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.
 		}
 
 		if err := db.Create(&session).Error; err != nil {
-			return responseHandler.Handle(c, nil, errors.New("failed to create session"))
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to create session: %w", err))
 		}
 
-		return responseHandler.Handle(c, fiber.Map{
+		return responseHandler.HandleResponse(c, fiber.Map{
 			"message": "Login successful",
 		}, nil)
 	}

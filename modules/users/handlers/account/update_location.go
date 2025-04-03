@@ -1,7 +1,8 @@
 package account
 
 import (
-	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/gofiber/fiber/v2"
@@ -32,52 +33,68 @@ type UpdateLocationRequest struct {
 // @Router /account/location [put]
 func UpdateLocation(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		// Retrieve the user from the context set by AuthMiddleware
+		// Authentication check with proper type assertion
 		user, ok := c.Locals("user").(models.User)
 		if !ok {
-			return responseHandler.Handle(c, nil, errors.New("user not found in context"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
 
-		// Parse the request body
+		// Parse request body
 		var req UpdateLocationRequest
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.Handle(c, nil, errors.New("invalid request body"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request body"))
 		}
 
-		// Initialize validator
+		// Initialize validator with detailed error messages
 		validate := validator.New()
 		if err := validate.Struct(req); err != nil {
 			validationErrors := err.(validator.ValidationErrors)
 			errorMessages := make(map[string]string)
+
 			for _, e := range validationErrors {
-				switch e.Field() {
-				case "Country":
-					errorMessages["country"] = "Country must be less than 100 characters"
-				case "State":
-					errorMessages["state"] = "State must be less than 100 characters"
-				case "City":
-					errorMessages["city"] = "City must be less than 100 characters"
-				case "Zip":
-					errorMessages["zip"] = "Zip must be less than 20 characters"
+				field := strings.ToLower(e.Field())
+				var message string
+
+				switch e.Tag() {
+				case "required":
+					message = "This field is required"
+				case "max":
+					message = fmt.Sprintf("Cannot exceed %s characters", e.Param())
+				default:
+					message = fmt.Sprintf("Invalid %s value", field)
 				}
+
+				errorMessages[field] = message
 			}
-			return responseHandler.Handle(c, map[string]interface{}{
-				"error":  "validation failed",
-				"fields": errorMessages,
-			}, errors.New("validation failed"))
+
+			return responseHandler.HandleResponse(c, fiber.Map{
+				"message": "Validation failed",
+				"errors":  errorMessages,
+			}, fiber.NewError(fiber.StatusUnprocessableEntity, "Validation failed"))
+		}
+
+		// Start database transaction
+		tx := db.Begin()
+		if tx.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to start transaction: %w", tx.Error))
 		}
 
 		// Fetch or create UserLocation
 		var userLocation models.UserLocation
-		if err := db.Where("user_id = ?", user.ID).First(&userLocation).Error; err != nil {
+		if err := tx.Where("user_id = ?", user.ID).First(&userLocation).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
-				userLocation = models.UserLocation{UserID: &user.ID} // Initialize with UserID
+				userLocation = models.UserLocation{UserID: &user.ID}
 			} else {
-				return responseHandler.Handle(c, nil, err)
+				tx.Rollback()
+				return responseHandler.HandleResponse(c, nil,
+					fmt.Errorf("failed to fetch location: %w", err))
 			}
 		}
 
-		// Update UserLocation fields if provided
+		// Update fields
 		if req.Country != "" {
 			userLocation.Country = req.Country
 		}
@@ -91,14 +108,21 @@ func UpdateLocation(db *gorm.DB, responseHandler *handlers.ResponseHandler) fibe
 			userLocation.Zip = req.Zip
 		}
 
-		// Save UserLocation (create or update)
-		if err := db.Save(&userLocation).Error; err != nil {
-			return responseHandler.Handle(c, nil, err)
+		// Save changes
+		if err := tx.Save(&userLocation).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to update location: %w", err))
 		}
 
-		// Return success message
-		return responseHandler.Handle(c, map[string]string{
-			"message": "updated successfully",
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to commit transaction: %w", err))
+		}
+
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Location updated successfully",
 		}, nil)
 	}
 }

@@ -1,7 +1,8 @@
 package security
 
 import (
-	"errors"
+	"fmt"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/muga20/artsMarket/modules/users/models"
 	"github.com/muga20/artsMarket/pkg/logs/handlers"
@@ -11,7 +12,8 @@ import (
 
 // ChangePasswordRequest defines the structure for password change requests
 type ChangePasswordRequest struct {
-	NewPassword string `json:"new_password" validate:"required,min=8"`
+	NewPassword     string `json:"new_password" validate:"required,min=8"`
+	CurrentPassword string `json:"current_password"`
 }
 
 // ChangePassword allows the user to change their password
@@ -28,72 +30,87 @@ type ChangePasswordRequest struct {
 // @Router /security/change-password [put]
 func ChangePassword(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		// Get the user from context (assumed to be set by authentication middleware)
+		// Authentication check with proper type assertion
 		user, ok := c.Locals("user").(models.User)
 		if !ok {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false,
-				"message": "user not found in context",
-			}, errors.New("user not found in context"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
 
-		// Parse the request body for the new password
+		// Parse request body
 		var req ChangePasswordRequest
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false,
-				"message": "invalid request body",
-			}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request body"))
 		}
 
-		// Validate the new password length
+		// Validate password requirements
 		if len(req.NewPassword) < 8 {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false,
-				"message": "password must be at least 8 characters",
-			}, errors.New("password too short"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Password must be at least 8 characters"))
 		}
 
-		// Retrieve the user's current hashed password from the database
+		// Fetch user security record
 		var userSecurity models.UserSecurity
 		if err := db.Where("user_id = ?", user.ID).First(&userSecurity).Error; err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false,
-				"message": "failed to retrieve user security data",
-			}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to fetch user security: %w", err))
 		}
 
-		// Check if the new password is the same as the old one
-		err := bcrypt.CompareHashAndPassword([]byte(userSecurity.Password), []byte(req.NewPassword))
-		if err == nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false,
-				"message": "new password must not be the same as the previous password",
-			}, errors.New("password reuse attempt"))
+		// Verify current password if provided (for password change flow)
+		if req.CurrentPassword != "" {
+			if err := bcrypt.CompareHashAndPassword([]byte(userSecurity.Password), []byte(req.CurrentPassword)); err != nil {
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusUnauthorized, "Current password is incorrect"))
+			}
 		}
 
-		// Hash the new password
+		// Check if new password is same as current
+		if err := bcrypt.CompareHashAndPassword([]byte(userSecurity.Password), []byte(req.NewPassword)); err == nil {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "New password must be different from current password"))
+		}
+
+		// Hash new password
 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
 		if err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false,
-				"message": "failed to hash password",
-			}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to hash password: %w", err))
 		}
 
-		// Update the password in the user security table
+		// Start transaction
+		tx := db.Begin()
+		if tx.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to start transaction: %w", tx.Error))
+		}
+
+		// Update password and clear any password reset tokens
 		userSecurity.Password = string(hashedPassword)
-		if err := db.Save(&userSecurity).Error; err != nil {
-			return responseHandler.Handle(c, map[string]interface{}{
-				"success": false,
-				"message": "failed to update password",
-			}, err)
+		userSecurity.PasswordResetToken = nil
+		userSecurity.PasswordResetExpiresAt = nil
+
+		if err := tx.Save(&userSecurity).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to update password: %w", err))
 		}
 
-		// Return a success response
-		return responseHandler.Handle(c, map[string]interface{}{
-			"success": true,
-			"message": "password changed successfully",
+		// Invalidate all active sessions (optional)
+		if err := tx.Where("user_id = ?", user.ID).Delete(&models.UserSession{}).Error; err != nil {
+			tx.Rollback()
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to clear sessions: %w", err))
+		}
+
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to commit transaction: %w", err))
+		}
+
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Password changed successfully. Please log in again.",
 		}, nil)
 	}
 }

@@ -2,6 +2,7 @@ package engagement
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -23,41 +24,55 @@ import (
 // @Router /engagement/block/{id} [post]
 func BlockUser(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		// Authentication check
 		user, ok := c.Locals("user").(models.User)
 		if !ok {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "User not authenticated"}, fmt.Errorf("unauthenticated request"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
 
+		// Validate blocked user ID
 		blockedUserID := c.Params("id")
 		if user.ID.String() == blockedUserID {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "You cannot block yourself"}, nil)
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "You cannot block yourself"))
 		}
 
+		// Parse UUID
 		blockedUUID, err := uuid.Parse(blockedUserID)
 		if err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Invalid user ID"}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid user ID"))
 		}
 
 		// Check if user is already blocked
 		var count int64
-		err = db.Model(&models.BlockedUser{}).Where("user_id = ? AND blocked_user_id = ?", user.ID, blockedUUID).Count(&count).Error
-		if err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Database error"}, err)
-		}
-		if count > 0 {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "User is already blocked"}, nil)
+		if err := db.Model(&models.BlockedUser{}).
+			Where("user_id = ? AND blocked_user_id = ?", user.ID, blockedUUID).
+			Count(&count).Error; err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("database error checking block status: %w", err))
 		}
 
-		// Block user
+		if count > 0 {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusConflict, "User is already blocked"))
+		}
+
+		// Create block entry
 		blockEntry := models.BlockedUser{
 			UserID:        user.ID,
 			BlockedUserID: blockedUUID,
 		}
+
 		if err := db.Create(&blockEntry).Error; err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Could not block user"}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("database error creating block: %w", err))
 		}
 
-		return responseHandler.HandleResponse(c, fiber.Map{"success": true, "message": "User blocked successfully"}, nil)
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "User Blocked",
+		}, nil)
 	}
 }
 
@@ -73,23 +88,39 @@ func BlockUser(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Han
 // @Router /engagement/unblock/{id} [delete]
 func UnblockUser(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		// Authentication check
 		user, ok := c.Locals("user").(models.User)
 		if !ok {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "User not authenticated"}, fmt.Errorf("unauthenticated request"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
 
+		// Validate and parse user ID
 		blockedUserID := c.Params("id")
 		blockedUUID, err := uuid.Parse(blockedUserID)
 		if err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Invalid user ID"}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid user ID"))
 		}
 
-		// Delete block record
-		if err := db.Where("user_id = ? AND blocked_user_id = ?", user.ID, blockedUUID).Delete(&models.BlockedUser{}).Error; err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Could not unblock user"}, err)
+		// Perform unblock operation
+		result := db.Where("user_id = ? AND blocked_user_id = ?", user.ID, blockedUUID).
+			Delete(&models.BlockedUser{})
+
+		if result.Error != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("database error unblocking user: %w", result.Error))
 		}
 
-		return responseHandler.HandleResponse(c, fiber.Map{"success": true, "message": "User unblocked successfully"}, nil)
+		// Check if any rows were actually deleted
+		if result.RowsAffected == 0 {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusNotFound, "User was not blocked"))
+		}
+
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "User unblocked",
+		}, nil)
 	}
 }
 
@@ -104,42 +135,70 @@ func UnblockUser(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.H
 // @Router /engagement/blocked [get]
 func GetBlockedUsers(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		// Authentication check
 		user, ok := c.Locals("user").(models.User)
 		if !ok {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "User not authenticated"}, fmt.Errorf("unauthenticated request"))
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
 
-		// Struct to hold the result of blocked users with necessary fields
-		var blockedUsers []struct {
+		type BlockedUser struct {
 			BlockedUserID uuid.UUID `json:"blocked_user_id"`
 			Username      string    `json:"username"`
-			FirstName     string    `json:"first_name"`
-			LastName      string    `json:"last_name"`
+			FirstName     string    `json:"first_name,omitempty"`
+			LastName      string    `json:"last_name,omitempty"`
+			ProfileImage  string    `json:"profile_image,omitempty"`
 		}
 
-		// Perform a join with users table and user_details table to get the blocked user's username and names
-		err := db.Table("blocked_users").
-			Select("blocked_users.blocked_user_id, users.username, user_details.first_name, user_details.last_name").
-			Joins("JOIN users ON blocked_users.blocked_user_id = users.id").
-			Joins("LEFT JOIN user_details ON blocked_users.blocked_user_id = user_details.user_id").
-			Where("blocked_users.user_id = ?", user.ID).
-			Find(&blockedUsers).Error
-
-		if err != nil {
-			return responseHandler.HandleResponse(c, fiber.Map{"success": false, "message": "Error retrieving blocked users"}, err)
+		var result struct {
+			BlockedCount int64         `json:"blocked_count"`
+			BlockedUsers []BlockedUser `json:"blocked_users"`
 		}
 
-		// If no blocked users found, return an empty list
-		if len(blockedUsers) == 0 {
-			return responseHandler.HandleResponse(c, fiber.Map{
-				"success":       true,
-				"blocked_users": []interface{}{},
-			}, nil)
+		// Use parallel execution for better performance
+		errChan := make(chan error, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Get blocked users count
+		go func() {
+			defer wg.Done()
+			if err := db.Model(&models.BlockedUser{}).
+				Where("user_id = ?", user.ID).
+				Count(&result.BlockedCount).Error; err != nil {
+				errChan <- fmt.Errorf("blocked count error: %w", err)
+			}
+		}()
+
+		// Get blocked users with details
+		go func() {
+			defer wg.Done()
+			if err := db.Table("blocked_users").
+				Select(`
+                    blocked_users.blocked_user_id,
+                    users.username,
+                    user_details.first_name,
+                    user_details.last_name,
+                    user_details.profile_image
+                `).
+				Joins("JOIN users ON blocked_users.blocked_user_id = users.id").
+				Joins("LEFT JOIN user_details ON users.id = user_details.user_id").
+				Where("blocked_users.user_id = ?", user.ID).
+				Scan(&result.BlockedUsers).Error; err != nil {
+				errChan <- fmt.Errorf("blocked users details error: %w", err)
+			}
+		}()
+
+		wg.Wait()
+		close(errChan)
+
+		// Check for errors
+		for e := range errChan {
+			if e != nil {
+				return responseHandler.HandleResponse(c, nil, e)
+			}
 		}
 
-		return responseHandler.HandleResponse(c, fiber.Map{
-			"success":       true,
-			"blocked_users": blockedUsers,
-		}, nil)
+		return responseHandler.HandleResponse(c, result, nil)
 	}
 }

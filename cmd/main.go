@@ -8,6 +8,7 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/muga20/artsMarket/config"
 	"github.com/muga20/artsMarket/database"
+	arts_module "github.com/muga20/artsMarket/modules/artwork-management/routes"
 	"github.com/muga20/artsMarket/modules/notifications/services"
 	user_module "github.com/muga20/artsMarket/modules/users/routes"
 	"github.com/muga20/artsMarket/pkg/logs/handlers"
@@ -95,6 +96,7 @@ func setupRoutes(app *fiber.App, db *gorm.DB, responseHandler *handlers.Response
 	apiV1 := app.Group("/api/v1")
 	user_module.UserModuleSetupRoutes(apiV1, db, responseHandler, cld)
 	logs_module.LogsModuleSetupRoutes(apiV1, db, responseHandler)
+	arts_module.ArtsManagementSetupRoutes(apiV1, db, cld, responseHandler)
 }
 
 func startServer(app *fiber.App) {

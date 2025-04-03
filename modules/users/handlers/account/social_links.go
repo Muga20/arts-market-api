@@ -1,6 +1,9 @@
 package account
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/muga20/artsMarket/modules/users/models"
@@ -35,15 +38,27 @@ type SocialLinkResponse struct {
 // @Router /account/social-links [post]
 func CreateSocialLink(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		user := c.Locals("user").(models.User)
-
-		var req SocialLinkRequest
-		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.HandleResponse(c, map[string]interface{}{
-				"success": false, "message": "Invalid request body",
-			}, err)
+		// Authentication check with proper type assertion
+		user, ok := c.Locals("user").(models.User)
+		if !ok {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
 
+		// Parse request body
+		var req SocialLinkRequest
+		if err := c.BodyParser(&req); err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request body"))
+		}
+
+		// Basic validation (add more specific validation as needed)
+		if req.Platform == "" || req.Link == "" {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Platform and link are required"))
+		}
+
+		// Create social link
 		socialLink := models.SocialLink{
 			UserID:   user.ID,
 			Platform: req.Platform,
@@ -51,13 +66,17 @@ func CreateSocialLink(db *gorm.DB, responseHandler *handlers.ResponseHandler) fi
 		}
 
 		if err := db.Create(&socialLink).Error; err != nil {
-			return responseHandler.HandleResponse(c, map[string]interface{}{
-				"success": false, "message": "Failed to create social link",
-			}, err)
+			// Handle duplicate entry or other DB errors
+			if strings.Contains(err.Error(), "duplicate") {
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusConflict, "Social link for this platform already exists"))
+			}
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to create social link: %w", err))
 		}
 
-		return responseHandler.HandleResponse(c, map[string]interface{}{
-			"success": true, "message": "Social link created successfully",
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Social link created successfully",
 		}, nil)
 	}
 }
@@ -73,18 +92,24 @@ func CreateSocialLink(db *gorm.DB, responseHandler *handlers.ResponseHandler) fi
 // @Router /account/social-links [get]
 func GetSocialLinks(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		user := c.Locals("user").(models.User)
+		// Authentication check with proper type assertion
+		user, ok := c.Locals("user").(models.User)
+		if !ok {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
+		}
+
+		// Retrieve social links
 		var socialLinks []models.SocialLink
 		if err := db.Where("user_id = ?", user.ID).
 			Select("id, user_id, platform, link").
 			Find(&socialLinks).Error; err != nil {
-			return responseHandler.HandleResponse(c, map[string]interface{}{
-				"success": false, "message": "Failed to retrieve social links",
-			}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to retrieve social links: %w", err))
 		}
 
-		// Prepare response by excluding the 'User' field
-		var responseLinks []SocialLinkResponse
+		// Prepare response
+		responseLinks := make([]SocialLinkResponse, 0, len(socialLinks))
 		for _, link := range socialLinks {
 			responseLinks = append(responseLinks, SocialLinkResponse{
 				ID:       link.ID,
@@ -94,9 +119,8 @@ func GetSocialLinks(db *gorm.DB, responseHandler *handlers.ResponseHandler) fibe
 			})
 		}
 
-		return responseHandler.HandleResponse(c, map[string]interface{}{
-			"success":     true,
-			"socialLinks": responseLinks, // Return without 'User'
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"social_links": responseLinks,
 		}, nil)
 	}
 }
@@ -116,27 +140,63 @@ func GetSocialLinks(db *gorm.DB, responseHandler *handlers.ResponseHandler) fibe
 // @Router /account/social-links/{id} [put]
 func UpdateSocialLink(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		user := c.Locals("user").(models.User)
-		socialLinkID := c.Params("id")
-		var socialLink models.SocialLink
-		if err := db.Where("id = ? AND user_id = ?", socialLinkID, user.ID).First(&socialLink).Error; err != nil {
-			return responseHandler.HandleResponse(c, map[string]interface{}{"success": false, "message": "Social link not found"}, err)
+		// Authentication check
+		user, ok := c.Locals("user").(models.User)
+		if !ok {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
 		}
+
+		// Get social link ID
+		socialLinkID := c.Params("id")
+		if _, err := uuid.Parse(socialLinkID); err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid social link ID"))
+		}
+
+		// Find existing social link
+		var socialLink models.SocialLink
+		if err := db.Where("id = ? AND user_id = ?", socialLinkID, user.ID).
+			First(&socialLink).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusNotFound, "Social link not found"))
+			}
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to find social link: %w", err))
+		}
+
+		// Parse request body
 		var req SocialLinkRequest
 		if err := c.BodyParser(&req); err != nil {
-			return responseHandler.HandleResponse(c, map[string]interface{}{"success": false, "message": "Invalid request body"}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid request body"))
 		}
-		updates := map[string]interface{}{}
+
+		// Validate at least one field is provided
+		if req.Platform == "" && req.Link == "" {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "No fields provided for update"))
+		}
+
+		// Prepare updates
+		updates := make(map[string]interface{})
 		if req.Platform != "" {
 			updates["platform"] = req.Platform
 		}
 		if req.Link != "" {
 			updates["link"] = req.Link
 		}
+
+		// Perform update
 		if err := db.Model(&socialLink).Updates(updates).Error; err != nil {
-			return responseHandler.HandleResponse(c, map[string]interface{}{"success": false, "message": "Failed to update social link"}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to update social link: %w", err))
 		}
-		return responseHandler.HandleResponse(c, map[string]interface{}{"success": true, "message": "Social link updated successfully"}, nil)
+
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Social link updated successfully",
+		}, nil)
 	}
 }
 
@@ -153,15 +213,40 @@ func UpdateSocialLink(db *gorm.DB, responseHandler *handlers.ResponseHandler) fi
 // @Router /account/social-links/{id} [delete]
 func DeleteSocialLink(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		user := c.Locals("user").(models.User)
+		// Authentication check with type assertion
+		user, ok := c.Locals("user").(models.User)
+		if !ok {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusUnauthorized, "Authentication required"))
+		}
+
+		// Validate social link ID
 		socialLinkID := c.Params("id")
+		if _, err := uuid.Parse(socialLinkID); err != nil {
+			return responseHandler.HandleResponse(c, nil,
+				fiber.NewError(fiber.StatusBadRequest, "Invalid social link ID"))
+		}
+
+		// Verify social link exists and belongs to user
 		var socialLink models.SocialLink
-		if err := db.Where("id = ? AND user_id = ?", socialLinkID, user.ID).First(&socialLink).Error; err != nil {
-			return responseHandler.HandleResponse(c, map[string]interface{}{"success": false, "message": "Social link not found"}, err)
+		if err := db.Where("id = ? AND user_id = ?", socialLinkID, user.ID).
+			First(&socialLink).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return responseHandler.HandleResponse(c, nil,
+					fiber.NewError(fiber.StatusNotFound, "Social link not found"))
+			}
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to find social link: %w", err))
 		}
+
+		// Delete the social link
 		if err := db.Delete(&socialLink).Error; err != nil {
-			return responseHandler.HandleResponse(c, map[string]interface{}{"success": false, "message": "Failed to delete social link"}, err)
+			return responseHandler.HandleResponse(c, nil,
+				fmt.Errorf("failed to delete social link: %w", err))
 		}
-		return responseHandler.HandleResponse(c, map[string]interface{}{"success": true, "message": "Social link deleted successfully"}, nil)
+
+		return responseHandler.HandleResponse(c, fiber.Map{
+			"message": "Social link deleted successfully",
+		}, nil)
 	}
 }
