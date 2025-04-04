@@ -17,5 +17,5 @@ func ArtsManagementSetupRoutes(apiGroup fiber.Router, db *gorm.DB, cld *config.C
 	SetupMediumRoutes(apiGroup, db, responseHandler)
 	SetupTechniqueRoutes(apiGroup, db, responseHandler)
 	SetupCollectionRoutes(apiGroup, db, cld, responseHandler)
-
+	ArtWorksRoutes(apiGroup, db, cld, responseHandler)
 }

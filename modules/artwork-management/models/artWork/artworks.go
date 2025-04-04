@@ -1,13 +1,16 @@
 package models
 
 import (
+	"strings"
+	"time"
+
 	"github.com/google/uuid"
+	"github.com/gosimple/slug"
 	collection "github.com/muga20/artsMarket/modules/artwork-management/models/collection"
 	medium "github.com/muga20/artsMarket/modules/artwork-management/models/medium"
 	technique "github.com/muga20/artsMarket/modules/artwork-management/models/technique"
 	user "github.com/muga20/artsMarket/modules/users/models"
 	"gorm.io/gorm"
-	"time"
 )
 
 type ArtworkStatus string
@@ -51,6 +54,7 @@ type Artwork struct {
 	UserID         uuid.UUID     `gorm:"type:char(36);not null" json:"user_id"`
 	CollectionID   *uuid.UUID    `gorm:"type:char(36);not null" json:"collection_id"`
 	Title          string        `gorm:"type:varchar(255);not null" json:"title"`
+	Slug           string        `gorm:"type:varchar(255);not null;uniqueIndex" json:"slug"`
 	Description    string        `gorm:"type:text" json:"description"`
 	CreationDate   *time.Time    `gorm:"type:date" json:"creation_date"`
 	Price          *float64      `gorm:"type:decimal(10,2)" json:"price"`
@@ -78,7 +82,6 @@ type Artwork struct {
 	Editions   []Edition             `gorm:"foreignKey:ArtworkID;constraint:OnDelete:CASCADE"`
 }
 
-// BeforeCreate hook to generate UUID if not set
 func (a *Artwork) BeforeCreate(tx *gorm.DB) (err error) {
 	if a.ID == uuid.Nil {
 		a.ID = uuid.New()
@@ -100,5 +103,40 @@ func (a *Artwork) BeforeCreate(tx *gorm.DB) (err error) {
 		a.LicenseType = AllRightsReserved
 	}
 
+	// Generate slug from title if empty
+	if a.Slug == "" {
+		a.Slug = slug.Make(a.Title)
+
+		// Ensure slug is unique by appending UUID if needed
+		var count int64
+		tx.Model(&Artwork{}).
+			Where("slug = ?", a.Slug).
+			Count(&count)
+
+		if count > 0 {
+			a.Slug = slug.Make(a.Title + "-" + strings.Split(a.ID.String(), "-")[0])
+		}
+	}
+	return
+}
+
+// BeforeUpdate hook to update slug if title changes
+func (a *Artwork) BeforeUpdate(tx *gorm.DB) (err error) {
+	if tx.Statement.Changed("Title") {
+		newSlug := slug.Make(a.Title)
+		if newSlug != a.Slug {
+			a.Slug = newSlug
+
+			// Check for uniqueness
+			var count int64
+			tx.Model(&Artwork{}).
+				Where("slug = ? AND id != ?", a.Slug, a.ID).
+				Count(&count)
+
+			if count > 0 {
+				a.Slug = slug.Make(a.Title + "-" + strings.Split(a.ID.String(), "-")[0])
+			}
+		}
+	}
 	return
 }

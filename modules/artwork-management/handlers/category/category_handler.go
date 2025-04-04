@@ -99,27 +99,39 @@ func GetAllCategoriesHandler(db *gorm.DB, responseHandler *handlers.ResponseHand
 	}
 }
 
-// GetCategoryByIDHandler handles fetching a category by ID
-// @Summary Get a category by ID
-// @Description Retrieve a category's details using its ID
+// GetCategoryHandler handles fetching a category by either ID or slug
+// @Summary Get category by ID or slug
+// @Description Retrieves a category by its ID or slug
 // @Tags Categories
-// @Accept  json
-// @Produce  json
-// @Param id path string true "Category ID"
-// @Success 200 {object} map[string]interface{}
-// @Failure 404 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /categories/{id} [get]
-func GetCategoryByIDHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
+// @Accept json
+// @Produce json
+// @Param identifier path string true "Category ID (UUID) or slug"
+// @Success 200 {object} fiber.Map "Returns the category data"
+// @Failure 400 {object} map[string]string "Invalid request"
+// @Failure 404 {object} map[string]string "Category not found"
+// @Failure 500 {object} map[string]string "Internal server error"
+// @Router /categories/{identifier} [get]
+func GetCategoryHandler(db *gorm.DB, responseHandler *handlers.ResponseHandler) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		categoryID := c.Params("id")
-		if categoryID == "" {
+		identifier := c.Params("identifier")
+		if identifier == "" {
 			return responseHandler.HandleResponse(c, nil,
-				fiber.NewError(fiber.StatusBadRequest, "Category ID is required"))
+				fiber.NewError(fiber.StatusBadRequest, "Category identifier is required"))
 		}
 
 		var category models.Category
-		if err := db.Where("id = ?", categoryID).First(&category).Error; err != nil {
+		query := db.Model(&models.Category{})
+
+		// Determine if identifier is UUID or slug
+		if _, err := uuid.Parse(identifier); err == nil {
+			// It's a valid UUID, search by ID
+			query = query.Where("id = ?", identifier)
+		} else {
+			// Treat as slug
+			query = query.Where("slug = ?", identifier)
+		}
+
+		if err := query.First(&category).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return responseHandler.HandleResponse(c, nil,
 					fiber.NewError(fiber.StatusNotFound, "Category not found"))

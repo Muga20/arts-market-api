@@ -9,8 +9,8 @@ import (
 
 type ArtworkAttribute struct {
 	ID          uuid.UUID `gorm:"type:char(36);primaryKey;default:(UUID())" json:"id"`
-	ArtworkID   uint      `gorm:"primaryKey" json:"artwork_id"`
-	AttributeID uint      `gorm:"primaryKey" json:"attribute_id"`
+	ArtworkID   uuid.UUID `gorm:"type:char(36);not null;index" json:"artwork_id"`
+	AttributeID uuid.UUID `gorm:"type:char(36);not null;index" json:"attribute_id"`
 	Value       string    `gorm:"type:varchar(255)" json:"value"`
 
 	CreatedAt time.Time `gorm:"type:timestamp;default:CURRENT_TIMESTAMP" json:"created_at"`

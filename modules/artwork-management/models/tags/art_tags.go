@@ -10,8 +10,8 @@ import (
 
 type ArtworkTag struct {
 	ID        uuid.UUID `gorm:"type:char(36);primaryKey;default:(UUID())" json:"id"`
-	ArtworkID uint      `gorm:"not null;index" json:"artwork_id"`
-	TagID     uint      `gorm:"not null;index" json:"tag_id"`
+	ArtworkID uuid.UUID `gorm:"type:char(36);not null;index" json:"artwork_id"`
+	TagID     uuid.UUID `gorm:"type:char(36);not null;index" json:"tag_id"`
 
 	CreatedAt time.Time `gorm:"type:timestamp;default:CURRENT_TIMESTAMP" json:"created_at"`
 	UpdatedAt time.Time `gorm:"type:timestamp;default:CURRENT_TIMESTAMP" json:"updated_at"`

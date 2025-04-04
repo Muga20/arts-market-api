@@ -35,6 +35,7 @@ func GetAllCollectionsHandler(db *gorm.DB, responseHandler *handlers.ResponseHan
 			ID              string    `json:"id"`
 			UserID          string    `json:"user_id"`
 			Name            string    `json:"name"`
+			Slug            string    `json:"slug"`
 			Description     string    `json:"description"`
 			Status          string    `json:"status"`
 			CreatedAt       time.Time `json:"created_at"`
@@ -44,7 +45,7 @@ func GetAllCollectionsHandler(db *gorm.DB, responseHandler *handlers.ResponseHan
 		}
 
 		if err := db.Table("collections").
-			Select("id, user_id, name, description, status, created_at, updated_at, cover_image_url, primary_image_url").
+			Select("id, user_id, name, description, status, slug, created_at, updated_at, cover_image_url, primary_image_url").
 			Where("user_id = ?", user.ID).
 			Find(&collections).Error; err != nil {
 			return responseHandler.HandleResponse(c, nil,
@@ -115,6 +116,7 @@ func GetCollectionByIDHandler(db *gorm.DB, responseHandler *handlers.ResponseHan
 				"id":                collection.ID,
 				"user_id":           collection.UserID,
 				"name":              collection.Name,
+				"slug":              collection.Slug,
 				"description":       collection.Description,
 				"status":            collection.Status,
 				"cover_image_url":   collection.CoverImageURL,

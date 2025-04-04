@@ -17,6 +17,6 @@ func SetupCategoryRoutes(apiGroup fiber.Router, db *gorm.DB, responseHandler *ha
 	categoryGroup.Put("/:id", category.UpdateCategoryHandler(db, responseHandler))
 	categoryGroup.Put("/:id/toggle-active", category.ToggleCategoryActiveHandler(db, responseHandler))
 	categoryGroup.Delete("/:id", category.DeleteCategoryHandler(db, responseHandler))
-	categoryGroup.Get("/:id", category.GetCategoryByIDHandler(db, responseHandler))
+	categoryGroup.Get("/categories/:identifier", category.GetCategoryHandler(db, responseHandler))
 	categoryGroup.Get("/", category.GetAllCategoriesHandler(db, responseHandler))
 }

@@ -13,6 +13,7 @@ import (
 	user_module "github.com/muga20/artsMarket/modules/users/routes"
 	"github.com/muga20/artsMarket/pkg/logs/handlers"
 	logs_module "github.com/muga20/artsMarket/pkg/logs/routes"
+	"github.com/muga20/artsMarket/pkg/middleware"
 	"github.com/muga20/artsMarket/pkg/worker"
 
 	//"github.com/muga20/artsMarket/pkg/middleware"
@@ -38,7 +39,7 @@ func main() {
 
 	// Create and start the worker
 	worker := worker.NewNotificationWorker(notificationService, responseHandler, db)
-	go worker.Start() // Start the worker in a separate goroutine
+	go worker.Start()
 
 	// Start the Fiber app
 	app := fiber.New()
@@ -80,7 +81,7 @@ func configureMiddleware(app *fiber.App) {
 	}))
 
 	// Apply rate-limiting middleware
-	//app.Use(middleware.RateLimitMiddleware())
+	app.Use(middleware.RateLimitMiddleware())
 }
 
 func setupRoutes(app *fiber.App, db *gorm.DB, responseHandler *handlers.ResponseHandler) {

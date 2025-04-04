@@ -9,7 +9,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 	art "github.com/muga20/artsMarket/modules/artwork-management/models/artWork"
 	collectionModels "github.com/muga20/artsMarket/modules/artwork-management/models/collection"
-	models "github.com/muga20/artsMarket/modules/artwork-management/models/collection"
 	userModels "github.com/muga20/artsMarket/modules/users/models"
 	"github.com/muga20/artsMarket/pkg/logs/handlers"
 	"gorm.io/gorm"
@@ -147,11 +146,11 @@ func UpdateCollectionStatusHandler(db *gorm.DB, responseHandler *handlers.Respon
 		var newStatus collectionModels.CollectionStatus
 		switch strings.ToLower(status) {
 		case "publish":
-			newStatus = models.PublishedStatus
+			newStatus = collectionModels.PublishedStatus
 		case "archive":
-			newStatus = models.ArchivedStatus
+			newStatus = collectionModels.ArchivedStatus
 		case "draft":
-			newStatus = models.DraftStatus
+			newStatus = collectionModels.DraftStatus
 		default:
 			return responseHandler.HandleResponse(c, nil,
 				fiber.NewError(fiber.StatusBadRequest, "Invalid status. Must be publish, archive, or draft"))
@@ -169,7 +168,7 @@ func UpdateCollectionStatusHandler(db *gorm.DB, responseHandler *handlers.Respon
 		}
 
 		// Additional business rule: Can't publish empty collections
-		if newStatus == models.PublishedStatus {
+		if newStatus == collectionModels.PublishedStatus {
 			var artworkCount int64
 			if err := db.Model(&art.Artwork{}).Where("collection_id = ?", collectionID).Count(&artworkCount).Error; err != nil {
 				return responseHandler.HandleResponse(c, nil,
